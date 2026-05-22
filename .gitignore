@@ -1,0 +1,5 @@
+venv/
+models/
+frontend/node_modules/
+.env
+contract_docs/
