@@ -15,19 +15,23 @@ from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine, get_database_driver
 from app.routes import assistant, contracts, dashboard, maintenance, metadata, rules, verification
 from app.services.bootstrap import seed_defaults
+from app.services.llm import azure_llm
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    # On Oracle 23ai we let the schema_oracle23ai.sql DDL own the schema.
-    # Here we only ensure tables exist (idempotent create_all won't drop anything).
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        # On Oracle 23ai we let the schema_oracle23ai.sql DDL own the schema.
+        # Here we only ensure tables exist (idempotent create_all won't drop anything).
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
-    async with AsyncSessionLocal() as session:
-        await seed_defaults(session)
+        async with AsyncSessionLocal() as session:
+            await seed_defaults(session)
 
-    yield
+        yield
+    finally:
+        await azure_llm.aclose()
 
 
 app = FastAPI(

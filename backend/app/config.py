@@ -34,14 +34,21 @@ class Settings(BaseSettings):
         default=None, validation_alias="ORACLE_CLIENT_LIB_DIR"
     )
 
-    # Azure OpenAI — required for LLM extraction and RAG
-    azure_openai_api_key: str = Field(..., validation_alias="AZURE_OPENAI_API_KEY")
-    azure_openai_endpoint: str = Field(..., validation_alias="AZURE_OPENAI_ENDPOINT")
+    # LLM provider selection and credentials
+    llm_provider: str = Field(default="auto", validation_alias="LLM_PROVIDER")
+    azure_openai_api_key: str | None = Field(default=None, validation_alias="AZURE_OPENAI_API_KEY")
+    azure_openai_endpoint: str | None = Field(default=None, validation_alias="AZURE_OPENAI_ENDPOINT")
     azure_openai_deployment_name: str = Field(
         default="gpt-4o", validation_alias="AZURE_OPENAI_DEPLOYMENT_NAME"
     )
     azure_openai_api_version: str = Field(
         default="2024-02-15-preview", validation_alias="AZURE_OPENAI_API_VERSION"
+    )
+    google_ai_studio_api_key: str | None = Field(
+        default=None, validation_alias="GOOGLE_AI_STUDIO_API_KEY"
+    )
+    google_ai_studio_model: str = Field(
+        default="gemini-1.5-flash", validation_alias="GOOGLE_AI_STUDIO_MODEL"
     )
 
     sentence_transformer_model: str = Field(
@@ -49,6 +56,7 @@ class Settings(BaseSettings):
     )
     lock_lease_minutes: int = Field(default=15, validation_alias="LOCK_LEASE_MINUTES")
     dashboard_horizon_days: int = Field(default=30, validation_alias="DASHBOARD_HORIZON_DAYS")
+    
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -59,6 +67,14 @@ class Settings(BaseSettings):
             parts = [part.strip() for part in value.split(",") if part.strip()]
             return parts or ["*"]
         return ["*"]
+
+    @field_validator("llm_provider", mode="before")
+    @classmethod
+    def normalize_llm_provider(cls, value):
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            return normalized or "auto"
+        return "auto"
 
     def resolved_database_url(self) -> str:
         return (

@@ -149,10 +149,7 @@ def _extract_pdf_spatial(
 ) -> Optional[Dict[str, Any]]:
     """
     Uses pdfplumber to find the bounding box of `citation` text in the PDF.
-
-    Returns:
-        {"page": <1-indexed>, "rects": [[x0, y0, x1, y1], ...]}
-    or None if pdfplumber is unavailable or the text can't be found.
+    Injects original page constraints to calculate clean frontend overlay sizing.
     """
     if not file_bytes or not citation:
         return None
@@ -173,11 +170,10 @@ def _extract_pdf_spatial(
                 if citation_words[0] not in page_text:
                     continue
 
-                # Get word-level bounding boxes
+                # Fetch token boundaries with native spatial attributes
                 words = page.extract_words()
                 word_texts = [w["text"].lower() for w in words]
 
-                # Sliding window search for citation start
                 for i in range(len(word_texts)):
                     if word_texts[i] == citation_words[0]:
                         match_len = sum(
@@ -191,9 +187,12 @@ def _extract_pdf_spatial(
                             y0 = min(w["top"] for w in matched_words)
                             x1 = max(w["x1"] for w in matched_words)
                             y1 = max(w["bottom"] for w in matched_words)
+                            
                             return {
                                 "page": page_num,
                                 "rects": [[x0, y0, x1, y1]],
+                                "page_width": float(page.width),   # Added to track viewport scaling constraints
+                                "page_height": float(page.height)  # Added to track viewport scaling constraints
                             }
     except Exception as exc:
         print(f"[PDF Spatial] pdfplumber error: {exc}", file=sys.stderr)

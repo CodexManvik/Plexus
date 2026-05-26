@@ -120,7 +120,7 @@ const Assistant = () => {
         <h1 className="mt-sm text-3xl font-black text-primary tracking-tight">Ask the selected contract corpus</h1>
         <p className="mt-xs max-w-3xl text-sm text-on-surface-variant font-medium">
           Choose the documents you want to search, then ask for a summary, clause comparison, or specific obligation.
-          The assistant answers from the selected corpus and falls back gracefully if Azure OpenAI is not configured.
+          The assistant answers from the selected corpus and falls back gracefully if Azure OpenAI or Google AI Studio is not configured.
         </p>
       </div>
 

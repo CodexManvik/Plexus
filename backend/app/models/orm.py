@@ -20,6 +20,9 @@ from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.oracle.base import ischema_names
 from sqlalchemy.types import TypeDecorator, UserDefinedType
 
+# Native vector type abstraction provided by newer oracledb dialects
+from sqlalchemy.dialects.oracle import VECTOR
+
 from app.database import Base
 
 
@@ -66,41 +69,6 @@ class OracleNativeJSON(TypeDecorator):
 ischema_names["JSON"] = OracleJSONDDL
 
 
-# ─── Oracle VECTOR type (23ai native) ──────────────────────────────────────────
-# Oracle 23ai stores embedding vectors natively.
-# We use a CLOB as the SQLAlchemy-level storage and let the DDL in
-# schema_oracle23ai.sql create the real VECTOR(384) column.
-# For ORM inserts/reads we serialize as JSON string.
-
-class OracleVectorType(TypeDecorator):
-    """
-    Stores a float[] embedding as a JSON-serialized CLOB for SQLAlchemy ORM,
-    while the actual Oracle column is VECTOR(384, FLOAT32) (defined in DDL).
-    When Oracle driver returns a vector, it comes back as a list already.
-    """
-    impl = Text
-    cache_ok = True
-
-    def process_bind_param(self, value, dialect):
-        if value is None:
-            return None
-        if isinstance(value, (list, tuple)):
-            return json.dumps([float(v) for v in value])
-        return value  # already serialized string
-
-    def process_result_value(self, value, dialect):
-        if value is None:
-            return None
-        if isinstance(value, list):
-            return value  # Oracle driver already deserialized
-        if isinstance(value, str):
-            try:
-                return json.loads(value)
-            except Exception:
-                return None
-        return None
-
-
 # ─── Models ───────────────────────────────────────────────────────────────────
 
 class ContractMaster(Base):
@@ -135,16 +103,11 @@ class ContractMaster(Base):
     uploaded_filename = Column(String(255), nullable=True)
     uploaded_content_type = Column(String(120), nullable=True)
 
-    # Raw file bytes — the original PDF/DOCX is stored here for the viewer
     document_blob = Column(LargeBinary, nullable=True)
-
-    # Plain text extracted from the document (for keyword fallback + LLM context)
     document_text = Column(Text, nullable=True)
 
-    # Vector embedding of the full document text (384-dim all-MiniLM-L6-v2)
-    # In Oracle 23ai the DDL creates this as VECTOR(384, FLOAT32).
-    # SQLAlchemy sees it as a CLOB/Text; we serialize/deserialize manually.
-    document_vector = Column(OracleVectorType, nullable=True)
+    # Updated: Native VECTOR definition for direct 26ai serialization tracking
+    document_vector = Column(VECTOR(384), nullable=True)
 
     workflow_state = Column(
         String(30), default="STAGED_DRAFT", server_default="STAGED_DRAFT", nullable=False
@@ -156,12 +119,8 @@ class ContractMaster(Base):
     approved_by = Column(String(100), nullable=True)
 
     created_at = Column(DateTime, default=func.now(), server_default=func.now())
-    updated_at = Column(
-        DateTime, default=func.now(), onupdate=func.now(), server_default=func.now()
-    )
-    last_updated = Column(
-        DateTime, default=func.now(), onupdate=func.now(), server_default=func.now()
-    )
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), server_default=func.now())
+    last_updated = Column(DateTime, default=func.now(), onupdate=func.now(), server_default=func.now())
 
     parameters = relationship(
         "ContractParameterExtracted",
@@ -186,22 +145,19 @@ class ContractParameterExtracted(Base):
     )
     header_name = Column(String(150), nullable=False)
     param_name = Column(String(150), nullable=False)
-    original_extract = Column(Text, nullable=True)   # raw LLM extraction
-    user_override = Column(Text, nullable=True)       # human-edited value
+    original_extract = Column(Text, nullable=True)
+    user_override = Column(Text, nullable=True)
 
     match_score = Column(Numeric(precision=4, scale=3), nullable=True)
 
-    # The exact quoted sentence(s) from the document that sourced this param
     citation_text = Column(Text, nullable=True)
-    citation_start = Column(Integer, nullable=True)   # char offset in document_text
+    citation_start = Column(Integer, nullable=True)
     citation_end = Column(Integer, nullable=True)
 
-    # PDF spatial coordinates: {"page": N, "rects": [[x0,y0,x1,y1], ...]}
-    # populated by pdfplumber during extraction
     spatial_json = Column(OracleNativeJSON(), nullable=True)
 
-    # 384-dim embedding of citation_text for vector similarity search
-    vector_embed = Column(OracleVectorType, nullable=True)
+    # Updated: Native VECTOR definition for direct 26ai serialization tracking
+    vector_embed = Column(VECTOR(384), nullable=True)
 
     source_query = Column(String(250), nullable=True)
     is_user_added = Column(Boolean, default=False, nullable=False)
