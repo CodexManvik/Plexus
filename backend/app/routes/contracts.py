@@ -1,3 +1,12 @@
+"""
+contracts.py — key changes from original:
+
+1. file_bytes stored in document_blob (raw PDF/DOCX persisted for viewer).
+2. extraction_engine receives file_bytes + content_type for PDF coordinate extraction.
+3. document_vector computed and stored on upload.
+4. New endpoint GET /{contract_id}/document — serves the raw file.
+5. SQLite references removed.
+"""
 from __future__ import annotations
 
 import uuid
@@ -5,7 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -34,10 +43,13 @@ from app.schemas.pydantic_models import (
     WorkflowActionRequest,
 )
 from app.services.document_parser import extract_document_text
-from app.services.ocr import extraction_engine
+from app.services.extraction import extraction_engine
+from app.services import embeddings as emb
 
 router = APIRouter(prefix="/contracts", tags=["Contracts Workflow"])
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _parse_date(value: Optional[str]) -> Optional[date]:
     if not value:
@@ -115,7 +127,7 @@ def _serialize_contract(contract: ContractMaster, include_document_text: bool = 
         updated_at=contract.updated_at,
         last_updated=contract.last_updated,
         document_text=contract.document_text if include_document_text else None,
-        parameters=[_serialize_parameter(param) for param in contract.parameters],
+        parameters=[_serialize_parameter(p) for p in contract.parameters],
     )
 
 
@@ -137,16 +149,14 @@ async def _write_audit(
     old_value: Optional[str] = None,
     new_value: Optional[str] = None,
 ) -> None:
-    db.add(
-        ContractAuditTrail(
-            contract_id=contract_id,
-            action_type=action_type,
-            field_changed=field_changed,
-            old_value_clob=old_value,
-            new_value_clob=new_value,
-            modified_by=modified_by,
-        )
-    )
+    db.add(ContractAuditTrail(
+        contract_id=contract_id,
+        action_type=action_type,
+        field_changed=field_changed,
+        old_value_clob=old_value,
+        new_value_clob=new_value,
+        modified_by=modified_by,
+    ))
 
 
 async def _upsert_metadata_option(db: AsyncSession, category: str, value: Optional[str]) -> None:
@@ -154,10 +164,7 @@ async def _upsert_metadata_option(db: AsyncSession, category: str, value: Option
         return
     existing = await db.execute(
         select(MetadataOption).where(
-            and_(
-                MetadataOption.category == category,
-                MetadataOption.value == value,
-            )
+            and_(MetadataOption.category == category, MetadataOption.value == value)
         )
     )
     if existing.scalars().first() is None:
@@ -176,16 +183,12 @@ async def _load_active_rules(
             )
         )
     )
-    exact_rules = exact.scalars().all()
-    if exact_rules:
-        return exact_rules
-
+    rules = exact.scalars().all()
+    if rules:
+        return rules
     fallback = await db.execute(
         select(MasterExtractionRule).where(
-            and_(
-                MasterExtractionRule.is_active == True,
-                MasterExtractionRule.contract_type == contract_type,
-            )
+            and_(MasterExtractionRule.is_active == True, MasterExtractionRule.contract_type == contract_type)
         )
     )
     return fallback.scalars().all()
@@ -198,6 +201,8 @@ def _build_rule_payload(rule: MasterExtractionRule) -> Dict[str, Any]:
         "parameter_logic": rule.parameter_logic,
     }
 
+
+# ── Upload ────────────────────────────────────────────────────────────────────
 
 @router.post("/upload", response_model=ContractResponse, status_code=status.HTTP_202_ACCEPTED)
 async def upload_contract(
@@ -229,13 +234,18 @@ async def upload_contract(
     db: AsyncSession = Depends(get_db),
 ):
     file_bytes = await file.read()
-    document_text = extract_document_text(file.filename or "uploaded_document", file.content_type, file_bytes)
+    content_type = file.content_type or ""
 
+    # Extract plain text for LLM context
+    document_text = extract_document_text(file.filename or "uploaded_document", content_type, file_bytes)
     if not document_text:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Could not extract readable text from the uploaded document.",
         )
+
+    # Compute document-level vector embedding
+    doc_vector = emb.embed(document_text[:5000])  # embed first 5k chars for speed
 
     contract_id = f"CON-{uuid.uuid4().hex[:10].upper()}"
     contract = ContractMaster(
@@ -264,61 +274,57 @@ async def upload_contract(
         affiliates_subsidiaries_involved=affiliates_subsidiaries_involved,
         effective_date=_parse_date(effective_date),
         uploaded_filename=file.filename,
-        uploaded_content_type=file.content_type,
+        uploaded_content_type=content_type,
+        document_blob=file_bytes,          # ← raw file stored here
         document_text=document_text,
+        document_vector=doc_vector,        # ← 384-dim embedding
         workflow_state="STAGED_DRAFT",
         created_by=user_id,
     )
     db.add(contract)
 
-    await _upsert_metadata_option(db, "organization", organization)
-    await _upsert_metadata_option(db, "business_unit", business_unit)
-    await _upsert_metadata_option(db, "location", location)
-    await _upsert_metadata_option(db, "department", department)
-    await _upsert_metadata_option(db, "customer_partner_name", customer_partner_name)
-    await _upsert_metadata_option(db, "financial_year", financial_year)
-    await _upsert_metadata_option(db, "contract_type", contract_type)
-    await _upsert_metadata_option(db, "agreement_type", agreement_type)
-    await _upsert_metadata_option(db, "execution_type", execution_type)
+    for cat, val in [
+        ("organization", organization),
+        ("business_unit", business_unit),
+        ("location", location),
+        ("department", department),
+        ("customer_partner_name", customer_partner_name),
+        ("financial_year", financial_year),
+        ("contract_type", contract_type),
+        ("agreement_type", agreement_type),
+        ("execution_type", execution_type),
+    ]:
+        await _upsert_metadata_option(db, cat, val)
 
     await db.flush()
 
+    # LLM-based extraction with PDF coordinate mapping
     active_rules = await _load_active_rules(db, contract_type, agreement_type)
     if active_rules:
         extracted_params = await extraction_engine.run_extraction_for_rules(
             document_text=document_text,
-            rules=[_build_rule_payload(rule) for rule in active_rules],
+            rules=[_build_rule_payload(r) for r in active_rules],
+            file_bytes=file_bytes,
+            content_type=content_type,
         )
         for item in extracted_params:
-            if not item.get("original_extract"):
-                continue
-            db.add(
-                ContractParameterExtracted(
-                    contract_id=contract_id,
-                    header_name=item["header_name"],
-                    param_name=item["param_name"],
-                    original_extract=item["original_extract"],
-                    user_override=item["user_override"],
-                    match_score=item["match_score"],
-                    citation_text=item["citation_text"],
-                    citation_start=item["citation_start"],
-                    citation_end=item["citation_end"],
-                    spatial_json=item["spatial_json"],
-                    vector_embed=item["vector_embed"],
-                    source_query=item["source_query"],
-                    is_user_added=False,
-                )
-            )
+            db.add(ContractParameterExtracted(
+                contract_id=contract_id,
+                header_name=item["header_name"],
+                param_name=item["param_name"],
+                original_extract=item["original_extract"],
+                user_override=item["user_override"],
+                match_score=item["match_score"],
+                citation_text=item["citation_text"],
+                citation_start=item["citation_start"],
+                citation_end=item["citation_end"],
+                spatial_json=item["spatial_json"],
+                vector_embed=item["vector_embed"],
+                source_query=item["source_query"],
+                is_user_added=False,
+            ))
 
-    await _write_audit(
-        db,
-        contract_id=contract_id,
-        action_type="UPLOAD",
-        modified_by=user_id,
-        field_changed="workflow_state",
-        old_value=None,
-        new_value="STAGED_DRAFT",
-    )
+    await _write_audit(db, contract_id, "UPLOAD", user_id, "workflow_state", None, "STAGED_DRAFT")
     await db.commit()
 
     saved = await _load_contract(db, contract_id)
@@ -326,6 +332,38 @@ async def upload_contract(
         raise HTTPException(status_code=500, detail="Contract persisted but could not be loaded.")
     return _serialize_contract(saved)
 
+
+# ── Serve raw document (for PDF viewer) ───────────────────────────────────────
+
+@router.get("/{contract_id}/document")
+async def get_contract_document(contract_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Returns the raw uploaded file bytes with the correct content-type.
+    The frontend PDF viewer (PDF.js) fetches this endpoint and renders the file.
+    """
+    result = await db.execute(
+        select(ContractMaster.document_blob, ContractMaster.uploaded_content_type, ContractMaster.uploaded_filename)
+        .where(ContractMaster.contract_id == contract_id)
+    )
+    row = result.first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    blob, content_type, filename = row
+    if not blob:
+        raise HTTPException(status_code=404, detail="No document file stored for this contract")
+
+    return Response(
+        content=bytes(blob),
+        media_type=content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename or contract_id}"',
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
+
+
+# ── List / Search ─────────────────────────────────────────────────────────────
 
 def _apply_filters(query, filters: Dict[str, Optional[str]]):
     mapping = {
@@ -361,25 +399,17 @@ async def list_contracts(
     db: AsyncSession = Depends(get_db),
 ):
     filters = {
-        "organization": organization,
-        "business_unit": business_unit,
-        "location": location,
-        "department": department,
-        "contract_type": contract_type,
-        "agreement_type": agreement_type,
+        "organization": organization, "business_unit": business_unit,
+        "location": location, "department": department,
+        "contract_type": contract_type, "agreement_type": agreement_type,
         "customer_partner_name": customer_partner_name,
-        "financial_year": financial_year,
-        "workflow_state": workflow_state,
+        "financial_year": financial_year, "workflow_state": workflow_state,
     }
-
-    base_query = select(ContractMaster).options(selectinload(ContractMaster.parameters))
-    filtered_query = _apply_filters(base_query, filters)
-    filtered_query = filtered_query.order_by(ContractMaster.last_updated.desc()).limit(limit).offset(offset)
-
-    count_query = _apply_filters(select(func.count()).select_from(ContractMaster), filters)
-    total = (await db.execute(count_query)).scalar_one()
-
-    result = await db.execute(filtered_query)
+    base = select(ContractMaster).options(selectinload(ContractMaster.parameters))
+    filtered = _apply_filters(base, filters).order_by(ContractMaster.last_updated.desc()).limit(limit).offset(offset)
+    count_q = _apply_filters(select(func.count()).select_from(ContractMaster), filters)
+    total = (await db.execute(count_q)).scalar_one()
+    result = await db.execute(filtered)
     contracts = result.scalars().unique().all()
     return ContractListResponse(data=[_serialize_contract(c, include_document_text=False) for c in contracts], total=total)
 
@@ -395,35 +425,22 @@ async def search_contracts(
     db: AsyncSession = Depends(get_db),
 ):
     query = select(ContractMaster).options(selectinload(ContractMaster.parameters))
-    query = _apply_filters(
-        query,
-        {
-            "organization": organization,
-            "business_unit": business_unit,
-            "contract_type": contract_type,
-            "agreement_type": agreement_type,
-            "workflow_state": workflow_state,
-        },
-    )
-
+    query = _apply_filters(query, {
+        "organization": organization, "business_unit": business_unit,
+        "contract_type": contract_type, "agreement_type": agreement_type,
+        "workflow_state": workflow_state,
+    })
     if q:
-        query = query.where(
-            or_(
-                ContractMaster.contract_id.ilike(f"%{q}%"),
-                ContractMaster.contract_number.ilike(f"%{q}%"),
-                ContractMaster.customer_partner_name.ilike(f"%{q}%"),
-                ContractMaster.document_text.ilike(f"%{q}%"),
-                ContractMaster.additional_info.ilike(f"%{q}%"),
-            )
-        )
-
+        query = query.where(or_(
+            ContractMaster.contract_id.ilike(f"%{q}%"),
+            ContractMaster.contract_number.ilike(f"%{q}%"),
+            ContractMaster.customer_partner_name.ilike(f"%{q}%"),
+            ContractMaster.document_text.ilike(f"%{q}%"),
+        ))
     query = query.order_by(ContractMaster.last_updated.desc())
     result = await db.execute(query)
     contracts = result.scalars().unique().all()
-    return ContractSearchResponse(
-        data=[_serialize_contract(c, include_document_text=False) for c in contracts],
-        total=len(contracts),
-    )
+    return ContractSearchResponse(data=[_serialize_contract(c, include_document_text=False) for c in contracts], total=len(contracts))
 
 
 @router.get("/{contract_id}", response_model=ContractResponse)
@@ -434,16 +451,13 @@ async def get_contract_details(contract_id: str, db: AsyncSession = Depends(get_
     return _serialize_contract(contract)
 
 
+# ── Lock / Unlock ─────────────────────────────────────────────────────────────
+
 @router.post("/{contract_id}/lock", response_model=LockResponse)
-async def acquire_lock(
-    contract_id: str,
-    payload: LockAcquireRequest,
-    db: AsyncSession = Depends(get_db),
-):
+async def acquire_lock(contract_id: str, payload: LockAcquireRequest, db: AsyncSession = Depends(get_db)):
     contract = await _load_contract(db, contract_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Contract not found")
-
     now = datetime.now(timezone.utc)
     if (
         contract.checked_out_by
@@ -451,143 +465,79 @@ async def acquire_lock(
         and contract.checkout_expiry
         and contract.checkout_expiry > now
     ):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Contract is currently locked by {contract.checked_out_by}",
-        )
-
+        raise HTTPException(status_code=409, detail=f"Locked by {contract.checked_out_by}")
     contract.checked_out_by = payload.user_id
     contract.checkout_expiry = now + timedelta(minutes=settings.lock_lease_minutes)
-    await _write_audit(
-        db,
-        contract_id=contract_id,
-        action_type="LOCK_ACQUIRED",
-        modified_by=payload.user_id,
-        field_changed="checked_out_by",
-        old_value=None,
-        new_value=payload.user_id,
-    )
+    await _write_audit(db, contract_id, "LOCK_ACQUIRED", payload.user_id, "checked_out_by", None, payload.user_id)
     await db.commit()
-    return LockResponse(
-        contract_id=contract_id,
-        checked_out_by=contract.checked_out_by,
-        checkout_expiry=contract.checkout_expiry,
-        lock_acquired=True,
-    )
+    return LockResponse(contract_id=contract_id, checked_out_by=contract.checked_out_by, checkout_expiry=contract.checkout_expiry, lock_acquired=True)
 
 
 @router.post("/{contract_id}/unlock")
-async def release_lock(
-    contract_id: str,
-    payload: LockAcquireRequest,
-    db: AsyncSession = Depends(get_db),
-):
+async def release_lock(contract_id: str, payload: LockAcquireRequest, db: AsyncSession = Depends(get_db)):
     contract = await _load_contract(db, contract_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Contract not found")
-
     if contract.checked_out_by and contract.checked_out_by != payload.user_id:
         raise HTTPException(status_code=403, detail="Only lock owner can release lock")
-
     old_owner = contract.checked_out_by
     contract.checked_out_by = None
     contract.checkout_expiry = None
-    await _write_audit(
-        db,
-        contract_id=contract_id,
-        action_type="LOCK_RELEASED",
-        modified_by=payload.user_id,
-        field_changed="checked_out_by",
-        old_value=old_owner,
-        new_value=None,
-    )
+    await _write_audit(db, contract_id, "LOCK_RELEASED", payload.user_id, "checked_out_by", old_owner, None)
     await db.commit()
     return {"status": "unlocked"}
 
 
+# ── Parameter update / verify ─────────────────────────────────────────────────
+
 @router.put("/{contract_id}/parameters/{param_id}", response_model=ParameterResponse)
 async def update_parameter_override(
-    contract_id: str,
-    param_id: int,
-    payload: ParameterUpdateRequest,
-    db: AsyncSession = Depends(get_db),
+    contract_id: str, param_id: int, payload: ParameterUpdateRequest, db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(
         select(ContractParameterExtracted).where(
-            and_(
-                ContractParameterExtracted.contract_id == contract_id,
-                ContractParameterExtracted.parameter_id == param_id,
-            )
+            and_(ContractParameterExtracted.contract_id == contract_id, ContractParameterExtracted.parameter_id == param_id)
         )
     )
-    parameter = result.scalars().first()
-    if parameter is None:
+    param = result.scalars().first()
+    if param is None:
         raise HTTPException(status_code=404, detail="Parameter not found")
-
-    old_value = parameter.user_override
-    parameter.user_override = payload.user_override
-    parameter.last_modified = datetime.utcnow()
-
+    old = param.user_override
+    param.user_override = payload.user_override
+    param.last_modified = datetime.utcnow()
     contract = await db.get(ContractMaster, contract_id)
     if contract:
         contract.document_version = (contract.document_version or 1) + 1
-
-    await _write_audit(
-        db,
-        contract_id=contract_id,
-        action_type="HUMAN_EDIT",
-        modified_by=payload.modified_by,
-        field_changed=f"parameter:{param_id}",
-        old_value=old_value,
-        new_value=payload.user_override,
-    )
+    await _write_audit(db, contract_id, "HUMAN_EDIT", payload.modified_by, f"parameter:{param_id}", old, payload.user_override)
     await db.commit()
-    await db.refresh(parameter)
-    return _serialize_parameter(parameter)
+    await db.refresh(param)
+    return _serialize_parameter(param)
 
 
 @router.post("/{contract_id}/parameters/{param_id}/verify", response_model=ParameterResponse)
 async def verify_parameter(
-    contract_id: str,
-    param_id: int,
-    payload: ParameterVerifyRequest,
-    db: AsyncSession = Depends(get_db),
+    contract_id: str, param_id: int, payload: ParameterVerifyRequest, db: AsyncSession = Depends(get_db)
 ):
     result = await db.execute(
         select(ContractParameterExtracted).where(
-            and_(
-                ContractParameterExtracted.contract_id == contract_id,
-                ContractParameterExtracted.parameter_id == param_id,
-            )
+            and_(ContractParameterExtracted.contract_id == contract_id, ContractParameterExtracted.parameter_id == param_id)
         )
     )
-    parameter = result.scalars().first()
-    if parameter is None:
+    param = result.scalars().first()
+    if param is None:
         raise HTTPException(status_code=404, detail="Parameter not found")
-
-    parameter.is_verified = payload.is_verified
-    parameter.verification_note = payload.note
-    parameter.last_modified = datetime.utcnow()
-
-    await _write_audit(
-        db,
-        contract_id=contract_id,
-        action_type="VERIFY_PARAMETER",
-        modified_by=payload.modified_by,
-        field_changed=f"parameter:{param_id}:verified",
-        old_value=str(not payload.is_verified),
-        new_value=str(payload.is_verified),
-    )
+    param.is_verified = payload.is_verified
+    param.verification_note = payload.note
+    param.last_modified = datetime.utcnow()
+    await _write_audit(db, contract_id, "VERIFY_PARAMETER", payload.modified_by, f"parameter:{param_id}:verified", str(not payload.is_verified), str(payload.is_verified))
     await db.commit()
-    await db.refresh(parameter)
-    return _serialize_parameter(parameter)
+    await db.refresh(param)
+    return _serialize_parameter(param)
 
 
 @router.post("/{contract_id}/search-add", response_model=ParameterResponse, status_code=status.HTTP_201_CREATED)
 async def add_parameter_from_search(
-    contract_id: str,
-    payload: DynamicSearchAddRequest,
-    db: AsyncSession = Depends(get_db),
+    contract_id: str, payload: DynamicSearchAddRequest, db: AsyncSession = Depends(get_db)
 ):
     contract = await _load_contract(db, contract_id)
     if contract is None:
@@ -595,19 +545,15 @@ async def add_parameter_from_search(
 
     extracted = await extraction_engine.run_extraction_for_rules(
         document_text=contract.document_text or "",
-        rules=[
-            {
-                "parameter_head": payload.parameter_head,
-                "parameter_name": payload.parameter_name,
-                "parameter_logic": payload.query,
-            }
-        ],
+        rules=[{"parameter_head": payload.parameter_head, "parameter_name": payload.parameter_name, "parameter_logic": payload.query}],
+        file_bytes=contract.document_blob,
+        content_type=contract.uploaded_content_type,
     )
     item = extracted[0]
     if not item.get("original_extract"):
-        raise HTTPException(status_code=422, detail="The search terms did not match any text in the document.")
+        raise HTTPException(status_code=422, detail="No matching text found in the document.")
 
-    parameter = ContractParameterExtracted(
+    param = ContractParameterExtracted(
         contract_id=contract_id,
         header_name=item["header_name"],
         param_name=item["param_name"],
@@ -618,224 +564,100 @@ async def add_parameter_from_search(
         citation_start=item["citation_start"],
         citation_end=item["citation_end"],
         spatial_json=item["spatial_json"],
+        vector_embed=item["vector_embed"],
         source_query=payload.query,
         is_user_added=True,
     )
-    db.add(parameter)
-
-    await _write_audit(
-        db,
-        contract_id=contract_id,
-        action_type="USER_SEARCH_ADD",
-        modified_by=payload.modified_by,
-        field_changed=f"search_add:{payload.parameter_name}",
-        old_value=None,
-        new_value=payload.query,
-    )
+    db.add(param)
+    await _write_audit(db, contract_id, "USER_SEARCH_ADD", payload.modified_by, f"search_add:{payload.parameter_name}", None, payload.query)
     await db.commit()
-    await db.refresh(parameter)
-    return _serialize_parameter(parameter)
+    await db.refresh(param)
+    return _serialize_parameter(param)
 
 
-async def _transition_workflow(
-    db: AsyncSession,
-    contract_id: str,
-    workflow_state: str,
-    payload: WorkflowActionRequest,
-    action_type: str,
-) -> Dict[str, str]:
+# ── Workflow transitions ───────────────────────────────────────────────────────
+
+async def _transition(db, contract_id, state, payload, action_type):
     contract = await db.get(ContractMaster, contract_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Contract not found")
-
-    previous_state = contract.workflow_state
-    contract.workflow_state = workflow_state
-    if workflow_state == "APPROVED":
+    prev = contract.workflow_state
+    contract.workflow_state = state
+    if state == "APPROVED":
         contract.approved_by = payload.modified_by
-
-    await _write_audit(
-        db,
-        contract_id=contract_id,
-        action_type=action_type,
-        modified_by=payload.modified_by,
-        field_changed="workflow_state",
-        old_value=previous_state,
-        new_value=workflow_state if not payload.comment else f"{workflow_state} | {payload.comment}",
-    )
+    note = f"{state} | {payload.comment}" if payload.comment else state
+    await _write_audit(db, contract_id, action_type, payload.modified_by, "workflow_state", prev, note)
     await db.commit()
-    return {"status": workflow_state}
+    return {"status": state}
 
 
 @router.post("/{contract_id}/submit-draft")
-async def submit_draft(
-    contract_id: str,
-    payload: WorkflowActionRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    return await _transition_workflow(
-        db,
-        contract_id=contract_id,
-        workflow_state="STAGED_DRAFT",
-        payload=payload,
-        action_type="SUBMIT_DRAFT",
-    )
-
+async def submit_draft(contract_id: str, payload: WorkflowActionRequest, db: AsyncSession = Depends(get_db)):
+    return await _transition(db, contract_id, "STAGED_DRAFT", payload, "SUBMIT_DRAFT")
 
 @router.post("/{contract_id}/submit-approval")
-async def submit_for_approval(
-    contract_id: str,
-    payload: WorkflowActionRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    return await _transition_workflow(
-        db,
-        contract_id=contract_id,
-        workflow_state="PENDING_APPROVAL",
-        payload=payload,
-        action_type="SUBMIT_FOR_APPROVAL",
-    )
-
+async def submit_for_approval(contract_id: str, payload: WorkflowActionRequest, db: AsyncSession = Depends(get_db)):
+    return await _transition(db, contract_id, "PENDING_APPROVAL", payload, "SUBMIT_FOR_APPROVAL")
 
 @router.post("/{contract_id}/approve")
-async def approve_contract(
-    contract_id: str,
-    payload: WorkflowActionRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    return await _transition_workflow(
-        db,
-        contract_id=contract_id,
-        workflow_state="APPROVED",
-        payload=payload,
-        action_type="APPROVE_CONTRACT",
-    )
-
+async def approve_contract(contract_id: str, payload: WorkflowActionRequest, db: AsyncSession = Depends(get_db)):
+    return await _transition(db, contract_id, "APPROVED", payload, "APPROVE_CONTRACT")
 
 @router.post("/{contract_id}/send-back")
-async def send_back_contract(
-    contract_id: str,
-    payload: WorkflowActionRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    return await _transition_workflow(
-        db,
-        contract_id=contract_id,
-        workflow_state="SENT_BACK",
-        payload=payload,
-        action_type="SEND_BACK",
-    )
-
+async def send_back_contract(contract_id: str, payload: WorkflowActionRequest, db: AsyncSession = Depends(get_db)):
+    return await _transition(db, contract_id, "SENT_BACK", payload, "SEND_BACK")
 
 @router.post("/{contract_id}/reject")
-async def reject_contract(
-    contract_id: str,
-    payload: WorkflowActionRequest,
-    db: AsyncSession = Depends(get_db),
-):
-    return await _transition_workflow(
-        db,
-        contract_id=contract_id,
-        workflow_state="SENT_BACK",
-        payload=payload,
-        action_type="REJECT_CONTRACT",
-    )
+async def reject_contract(contract_id: str, payload: WorkflowActionRequest, db: AsyncSession = Depends(get_db)):
+    return await _transition(db, contract_id, "SENT_BACK", payload, "REJECT_CONTRACT")
 
+
+# ── Misc ───────────────────────────────────────────────────────────────────────
 
 @router.get("/{contract_id}/compare")
-async def compare_versions(
-    contract_id: str,
-    compare_to_id: str,
-    db: AsyncSession = Depends(get_db),
-):
+async def compare_versions(contract_id: str, compare_to_id: str, db: AsyncSession = Depends(get_db)):
     first = await _load_contract(db, contract_id)
     second = await _load_contract(db, compare_to_id)
     if first is None or second is None:
         raise HTTPException(status_code=404, detail="One or both contracts not found")
-
-    return {
-        "contract1": _serialize_contract(first),
-        "contract2": _serialize_contract(second),
-    }
+    return {"contract1": _serialize_contract(first), "contract2": _serialize_contract(second)}
 
 
 @router.post("/{contract_id}/clone", response_model=ContractResponse, status_code=status.HTTP_201_CREATED)
-async def clone_contract_template(
-    contract_id: str,
-    payload: WorkflowActionRequest,
-    db: AsyncSession = Depends(get_db),
-):
+async def clone_contract_template(contract_id: str, payload: WorkflowActionRequest, db: AsyncSession = Depends(get_db)):
     source = await _load_contract(db, contract_id)
     if source is None:
         raise HTTPException(status_code=404, detail="Contract not found")
-
     clone_id = f"CON-{uuid.uuid4().hex[:10].upper()}"
     clone = ContractMaster(
-        contract_id=clone_id,
-        organization=source.organization,
-        business_unit=source.business_unit,
-        location=source.location,
-        department=source.department,
-        customer_partner_name=source.customer_partner_name,
-        financial_year=source.financial_year,
-        contract_type=source.contract_type,
-        agreement_type=source.agreement_type,
-        additional_info=source.additional_info,
-        contract_number=source.contract_number,
-        version_amendment_number=source.version_amendment_number,
-        execution_type=source.execution_type,
-        governing_entity=source.governing_entity,
-        jurisdiction=source.jurisdiction,
-        governing_law=source.governing_law,
-        legal_names_of_parties=source.legal_names_of_parties,
-        registered_addresses=source.registered_addresses,
-        cin_registration_numbers=source.cin_registration_numbers,
-        authorized_signatories=source.authorized_signatories,
-        contact_persons=source.contact_persons,
-        party_roles=source.party_roles,
+        contract_id=clone_id, organization=source.organization, business_unit=source.business_unit,
+        location=source.location, department=source.department, customer_partner_name=source.customer_partner_name,
+        financial_year=source.financial_year, contract_type=source.contract_type, agreement_type=source.agreement_type,
+        additional_info=source.additional_info, contract_number=source.contract_number,
+        version_amendment_number=source.version_amendment_number, execution_type=source.execution_type,
+        governing_entity=source.governing_entity, jurisdiction=source.jurisdiction, governing_law=source.governing_law,
+        legal_names_of_parties=source.legal_names_of_parties, registered_addresses=source.registered_addresses,
+        cin_registration_numbers=source.cin_registration_numbers, authorized_signatories=source.authorized_signatories,
+        contact_persons=source.contact_persons, party_roles=source.party_roles,
         affiliates_subsidiaries_involved=source.affiliates_subsidiaries_involved,
-        effective_date=source.effective_date,
-        uploaded_filename=source.uploaded_filename,
-        uploaded_content_type=source.uploaded_content_type,
-        document_text=source.document_text,
-        workflow_state="STAGED_DRAFT",
-        created_by=payload.modified_by,
+        effective_date=source.effective_date, uploaded_filename=source.uploaded_filename,
+        uploaded_content_type=source.uploaded_content_type, document_blob=source.document_blob,
+        document_text=source.document_text, document_vector=source.document_vector,
+        workflow_state="STAGED_DRAFT", created_by=payload.modified_by,
     )
     db.add(clone)
     await db.flush()
-
-    for param in source.parameters:
-        db.add(
-            ContractParameterExtracted(
-                contract_id=clone_id,
-                header_name=param.header_name,
-                param_name=param.param_name,
-                original_extract=param.original_extract,
-                user_override=param.user_override,
-                match_score=param.match_score,
-                citation_text=param.citation_text,
-                citation_start=param.citation_start,
-                citation_end=param.citation_end,
-                spatial_json=param.spatial_json,
-                source_query=param.source_query,
-                is_user_added=param.is_user_added,
-                is_verified=param.is_verified,
-                verification_note=param.verification_note,
-            )
-        )
-
-    await _write_audit(
-        db,
-        contract_id=clone_id,
-        action_type="CLONE_TEMPLATE",
-        modified_by=payload.modified_by,
-        field_changed="template_source",
-        old_value=contract_id,
-        new_value=clone_id,
-    )
+    for p in source.parameters:
+        db.add(ContractParameterExtracted(
+            contract_id=clone_id, header_name=p.header_name, param_name=p.param_name,
+            original_extract=p.original_extract, user_override=p.user_override, match_score=p.match_score,
+            citation_text=p.citation_text, citation_start=p.citation_start, citation_end=p.citation_end,
+            spatial_json=p.spatial_json, vector_embed=p.vector_embed, source_query=p.source_query,
+            is_user_added=p.is_user_added, is_verified=p.is_verified, verification_note=p.verification_note,
+        ))
+    await _write_audit(db, clone_id, "CLONE_TEMPLATE", payload.modified_by, "template_source", contract_id, clone_id)
     await db.commit()
     cloned = await _load_contract(db, clone_id)
-    if cloned is None:
-        raise HTTPException(status_code=500, detail="Cloned contract could not be loaded")
     return _serialize_contract(cloned)
 
 
@@ -846,19 +668,15 @@ async def get_audit_trail(contract_id: str, db: AsyncSession = Depends(get_db)):
         .where(ContractAuditTrail.contract_id == contract_id)
         .order_by(ContractAuditTrail.logged_timestamp.desc())
     )
-    audits = result.scalars().all()
-    return AuditTrailResponse(contract_id=contract_id, audit_trail=audits)
+    return AuditTrailResponse(contract_id=contract_id, audit_trail=result.scalars().all())
 
 
 @router.get("/{contract_id}/parameters")
 async def get_parameters(contract_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
-        select(ContractParameterExtracted).where(
-            ContractParameterExtracted.contract_id == contract_id
-        )
+        select(ContractParameterExtracted).where(ContractParameterExtracted.contract_id == contract_id)
     )
-    params = result.scalars().all()
-    return {"contract_id": contract_id, "parameters": [_serialize_parameter(p) for p in params]}
+    return {"contract_id": contract_id, "parameters": [_serialize_parameter(p) for p in result.scalars().all()]}
 
 
 @router.get("/{contract_id}/extraction-status", response_model=ExtractionStatusResponse)
@@ -866,23 +684,15 @@ async def get_extraction_status(contract_id: str, db: AsyncSession = Depends(get
     contract = await db.get(ContractMaster, contract_id)
     if contract is None:
         raise HTTPException(status_code=404, detail="Contract not found")
-
     result = await db.execute(
-        select(ContractParameterExtracted).where(
-            ContractParameterExtracted.contract_id == contract_id
-        )
+        select(ContractParameterExtracted).where(ContractParameterExtracted.contract_id == contract_id)
     )
     params = result.scalars().all()
     total = len(params)
     extracted = sum(1 for p in params if (p.original_extract or "").strip())
     verified = sum(1 for p in params if p.is_verified)
-    percentage = int((verified / total) * 100) if total else 0
-
     return ExtractionStatusResponse(
-        contract_id=contract_id,
-        status=contract.workflow_state,
-        total=total,
-        extracted=extracted,
-        verified=verified,
-        percentage=percentage,
+        contract_id=contract_id, status=contract.workflow_state,
+        total=total, extracted=extracted, verified=verified,
+        percentage=int((verified / total) * 100) if total else 0,
     )

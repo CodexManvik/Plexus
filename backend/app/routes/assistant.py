@@ -1,3 +1,8 @@
+"""
+assistant.py — RAG chatbot using Oracle 23ai VECTOR_DISTANCE for retrieval.
+
+Falls back to keyword scoring if embeddings are unavailable.
+"""
 from __future__ import annotations
 
 import re
@@ -16,242 +21,208 @@ from app.schemas.pydantic_models import (
     AssistantQueryResponse,
     AssistantSourceSnippet,
 )
+from app.services import embeddings as emb
 from app.services.llm import azure_llm
 
 router = APIRouter(prefix="/assistant", tags=["Assistant"])
 
+# ── Keyword fallback (used when vector embeddings unavailable) ────────────────
+
 TOKEN_RE = re.compile(r"[A-Za-z0-9']+")
 SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 STOPWORDS = {
-    "the",
-    "and",
-    "for",
-    "with",
-    "that",
-    "this",
-    "from",
-    "have",
-    "will",
-    "shall",
-    "must",
-    "into",
-    "your",
-    "their",
-    "have",
-    "been",
-    "are",
-    "was",
-    "were",
-    "not",
-    "any",
-    "all",
-    "can",
-    "may",
-    "our",
-    "you",
-    "we",
-    "but",
-    "or",
-    "its",
-    "within",
-    "under",
-    "over",
-    "than",
-    "then",
-    "there",
-    "here",
-    "each",
-    "such",
+    "the", "and", "for", "with", "that", "this", "from", "have", "will",
+    "shall", "must", "into", "your", "their", "been", "are", "was", "were",
+    "not", "any", "all", "can", "may", "our", "you", "we", "but", "or",
+    "its", "within", "under", "over", "than", "then", "there", "here",
+    "each", "such",
 }
 
 
 def _tokenize(text: str) -> List[str]:
-    return [token.lower() for token in TOKEN_RE.findall(text or "") if len(token) > 2 and token.lower() not in STOPWORDS]
+    return [
+        t.lower() for t in TOKEN_RE.findall(text or "")
+        if len(t) > 2 and t.lower() not in STOPWORDS
+    ]
 
 
 def _score(query_tokens: List[str], candidate: str) -> float:
     if not query_tokens or not candidate:
         return 0.0
-
-    candidate_tokens = _tokenize(candidate)
-    if not candidate_tokens:
+    c_tokens = _tokenize(candidate)
+    if not c_tokens:
         return 0.0
-
-    query_counts = Counter(query_tokens)
-    candidate_counts = Counter(candidate_tokens)
-    overlap = sum(min(query_counts[token], candidate_counts[token]) for token in query_counts)
+    qc = Counter(query_tokens)
+    cc = Counter(c_tokens)
+    overlap = sum(min(qc[t], cc[t]) for t in qc)
     if overlap <= 0:
         return 0.0
-
-    coverage = overlap / max(len(query_tokens), 1)
-    density = overlap / max(len(candidate_tokens), 1)
-    return round((coverage * 0.7) + (density * 0.3), 4)
+    return round((overlap / max(len(query_tokens), 1)) * 0.7 + (overlap / max(len(c_tokens), 1)) * 0.3, 4)
 
 
-def _split_sentences(text: str) -> List[str]:
-    return [sentence.strip() for sentence in SENTENCE_SPLIT_RE.split(text or "") if sentence.strip()]
+def _best_sentence(text: str, q_tokens: List[str]) -> tuple[str, float]:
+    best_s, best_sc = "", 0.0
+    for s in SENTENCE_SPLIT_RE.split(text or ""):
+        s = s.strip()
+        sc = _score(q_tokens, s)
+        if sc > best_sc:
+            best_s, best_sc = s, sc
+    if best_s:
+        return best_s, best_sc
+    fallback = (text or "").strip().replace("\n", " ")[:500]
+    return fallback, _score(q_tokens, fallback)
 
 
-def _best_sentence(text: str, query_tokens: List[str]) -> tuple[str, float]:
-    best_sentence = ""
-    best_score = 0.0
-    for sentence in _split_sentences(text):
-        score = _score(query_tokens, sentence)
-        if score > best_score:
-            best_sentence = sentence
-            best_score = score
-    if best_sentence:
-        return best_sentence, best_score
-    fallback = (text or "").strip().replace("\n", " ")
-    return fallback[:500], _score(query_tokens, fallback[:500]) if fallback else 0.0
-
+# ── Main query endpoint ────────────────────────────────────────────────────────
 
 async def _load_contracts(db: AsyncSession, contract_ids: List[str]) -> List[ContractMaster]:
-    query = (
+    q = (
         select(ContractMaster)
         .options(selectinload(ContractMaster.parameters))
         .where(ContractMaster.contract_id.in_(contract_ids))
     )
-    result = await db.execute(query)
+    result = await db.execute(q)
     contracts = result.scalars().all()
     if not contracts:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No matching documents found.")
-
-    order_index = {contract_id: index for index, contract_id in enumerate(contract_ids)}
-    contracts.sort(key=lambda contract: order_index.get(contract.contract_id, len(order_index)))
+    order = {cid: i for i, cid in enumerate(contract_ids)}
+    contracts.sort(key=lambda c: order.get(c.contract_id, len(order)))
     return contracts
 
 
 @router.post("/query", response_model=AssistantQueryResponse)
 async def ask_assistant(payload: AssistantQueryRequest, db: AsyncSession = Depends(get_db)):
-    contract_ids = [contract_id for contract_id in payload.contract_ids if contract_id.strip()]
+    # ── 1. Resolve which contracts to search ────────────────────────────────
+    contract_ids = [cid for cid in payload.contract_ids if cid.strip()]
     if not contract_ids:
         recent = await db.execute(
             select(ContractMaster)
             .options(selectinload(ContractMaster.parameters))
-            .order_by(ContractMaster.updated_at.desc().nullslast(), ContractMaster.created_at.desc().nullslast())
+            .order_by(ContractMaster.updated_at.desc().nullslast())
             .limit(5)
         )
         contracts = recent.scalars().all()
         if not contracts:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No documents available for retrieval.")
+            raise HTTPException(status_code=404, detail="No documents available.")
     else:
         contracts = await _load_contracts(db, contract_ids)
 
-    query_tokens = _tokenize(payload.question)
-    candidate_sources: List[AssistantSourceSnippet] = []
+    resolved_ids = [c.contract_id for c in contracts]
 
-    for contract in contracts:
-        document_text = contract.document_text or ""
-        document_sentence, document_score = _best_sentence(document_text, query_tokens)
-        summary_bits = [
-            contract.uploaded_filename or contract.contract_id,
-            contract.contract_type,
-            contract.agreement_type,
-            contract.organization,
-            contract.business_unit,
-            contract.department,
-            contract.workflow_state,
-        ]
-        summary_text = " | ".join(bit for bit in summary_bits if bit)
-        summary_score = _score(query_tokens, summary_text + " " + document_sentence)
-        if document_sentence:
-            candidate_sources.append(
-                AssistantSourceSnippet(
-                    contract_id=contract.contract_id,
-                    contract_type=contract.contract_type,
-                    agreement_type=contract.agreement_type,
-                    source_type="document",
-                    title=contract.uploaded_filename or contract.contract_id,
-                    snippet=document_sentence[:700],
-                    score=summary_score or document_score,
-                )
-            )
+    # ── 2. Vector retrieval (Oracle 23ai VECTOR_DISTANCE) ───────────────────
+    vector_hits = await emb.vector_search_parameters(
+        db,
+        query_text=payload.question,
+        contract_ids=resolved_ids if contract_ids else None,
+        top_k=payload.top_k * 2,  # over-fetch then re-rank
+    )
 
-        for parameter in contract.parameters:
-            parameter_text = " ".join(
-                value
-                for value in [
-                    parameter.header_name,
-                    parameter.param_name,
-                    parameter.user_override,
-                    parameter.original_extract,
-                    parameter.citation_text,
-                    parameter.source_query,
-                ]
-                if value
-            )
-            score = _score(query_tokens, parameter_text)
-            if score <= 0:
-                continue
+    sources: List[AssistantSourceSnippet] = []
 
-            snippet = parameter.user_override or parameter.original_extract or parameter.citation_text or parameter_text
-            candidate_sources.append(
-                AssistantSourceSnippet(
-                    contract_id=contract.contract_id,
-                    contract_type=contract.contract_type,
-                    agreement_type=contract.agreement_type,
-                    source_type="parameter",
-                    title=f"{parameter.header_name} / {parameter.param_name}",
-                    snippet=snippet[:700],
-                    score=score,
-                    parameter_head=parameter.header_name,
-                    parameter_name=parameter.param_name,
-                )
-            )
-
-    candidate_sources.sort(key=lambda item: item.score, reverse=True)
-    selected_sources = candidate_sources[: max(payload.top_k, 1)]
-    if not selected_sources:
-        selected_sources = [
+    # Convert vector hits to source snippets (cosine distance → score 0-1)
+    for hit in vector_hits:
+        distance = float(hit.get("distance") or 1.0)
+        score = round(max(0.0, 1.0 - distance), 4)
+        snippet = hit.get("user_override") or hit.get("original_extract") or hit.get("citation_text") or ""
+        sources.append(
             AssistantSourceSnippet(
-                contract_id=contract.contract_id,
-                contract_type=contract.contract_type,
-                agreement_type=contract.agreement_type,
-                source_type="document",
-                title=contract.uploaded_filename or contract.contract_id,
-                snippet=(contract.document_text or "")[:700],
-                score=0.0,
+                contract_id=hit["contract_id"],
+                contract_type=hit.get("contract_type"),
+                agreement_type=hit.get("agreement_type"),
+                source_type="parameter",
+                title=f"{hit.get('header_name', '')} / {hit.get('param_name', '')}",
+                snippet=snippet[:700],
+                score=score,
+                parameter_head=hit.get("header_name"),
+                parameter_name=hit.get("param_name"),
             )
-            for contract in contracts[: payload.top_k]
-        ]
+        )
 
-    source_context = []
-    for index, source in enumerate(selected_sources, start=1):
-        source_context.append(
-            f"{index}. [{source.contract_id}] {source.title} ({source.source_type}, score={source.score:.2f})\n{source.snippet}"
+    # ── 3. Keyword fallback if vector search returned nothing ────────────────
+    if not sources:
+        q_tokens = _tokenize(payload.question)
+        for contract in contracts:
+            for param in contract.parameters:
+                combined = " ".join(
+                    v for v in [
+                        param.header_name, param.param_name,
+                        param.user_override, param.original_extract,
+                        param.citation_text,
+                    ]
+                    if v
+                )
+                sc = _score(q_tokens, combined)
+                if sc <= 0:
+                    continue
+                snippet = param.user_override or param.original_extract or param.citation_text or ""
+                sources.append(
+                    AssistantSourceSnippet(
+                        contract_id=contract.contract_id,
+                        contract_type=contract.contract_type,
+                        agreement_type=contract.agreement_type,
+                        source_type="parameter",
+                        title=f"{param.header_name} / {param.param_name}",
+                        snippet=snippet[:700],
+                        score=sc,
+                        parameter_head=param.header_name,
+                        parameter_name=param.param_name,
+                    )
+                )
+
+        # Also search raw document text
+        for contract in contracts:
+            doc_sentence, doc_score = _best_sentence(contract.document_text or "", q_tokens)
+            if doc_sentence:
+                sources.append(
+                    AssistantSourceSnippet(
+                        contract_id=contract.contract_id,
+                        contract_type=contract.contract_type,
+                        agreement_type=contract.agreement_type,
+                        source_type="document",
+                        title=contract.uploaded_filename or contract.contract_id,
+                        snippet=doc_sentence[:700],
+                        score=doc_score,
+                    )
+                )
+
+        sources.sort(key=lambda s: s.score, reverse=True)
+
+    selected = sources[: max(payload.top_k, 1)]
+
+    # ── 4. Build prompt and call Azure OpenAI ───────────────────────────────
+    context_lines = []
+    for i, src in enumerate(selected, 1):
+        context_lines.append(
+            f"{i}. [{src.contract_id}] {src.title} (score={src.score:.2f})\n{src.snippet}"
         )
 
     system_prompt = (
         "You are ContractLens AI, a contract retrieval assistant. "
         "Answer strictly from the provided contract excerpts. "
-        "If the excerpts do not contain the answer, say that the selected documents do not show it. "
-        "Be concise, practical, and cite the relevant contract IDs when possible."
+        "If the excerpts do not contain the answer, say the selected documents do not show it. "
+        "Be concise and cite relevant contract IDs."
     )
     user_prompt = (
         f"Question: {payload.question}\n\n"
-        f"Selected documents: {', '.join(contract.contract_id for contract in contracts)}\n\n"
-        "Relevant excerpts:\n"
-        + "\n\n".join(source_context)
+        f"Selected contracts: {', '.join(resolved_ids)}\n\n"
+        "Relevant excerpts:\n" + "\n\n".join(context_lines)
     )
 
     answer = await azure_llm.get_chat_completion(system_prompt, user_prompt)
     used_llm = bool(answer.strip())
+
     if not used_llm:
-        answer_lines = [
-            "Azure OpenAI is not configured, so this is a retrieval-only summary.",
-            "",
-            f"Question: {payload.question}",
+        lines = [
+            "Azure OpenAI is not configured — retrieval-only summary.",
+            f"\nQuestion: {payload.question}",
         ]
-        for source in selected_sources:
-            answer_lines.append(
-                f"- [{source.contract_id}] {source.title}: {source.snippet}"
-            )
-        answer = "\n".join(answer_lines)
+        for src in selected:
+            lines.append(f"- [{src.contract_id}] {src.title}: {src.snippet}")
+        answer = "\n".join(lines)
 
     return AssistantQueryResponse(
         answer=answer,
-        contract_ids=[contract.contract_id for contract in contracts],
-        sources=selected_sources,
+        contract_ids=resolved_ids,
+        sources=selected,
         used_llm=used_llm,
     )

@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import List, Literal
+from typing import List
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -25,28 +25,18 @@ class Settings(BaseSettings):
     cors_origins_raw: str = Field(default="*", validation_alias="CORS_ORIGINS")
     cors_origins: List[str] = Field(default_factory=lambda: ["*"])
 
-    database_backend: Literal["auto", "oracle26ai", "sqlite"] = Field(
-        default="auto", validation_alias="DATABASE_BACKEND"
-    )
-    database_url: str | None = Field(default=None, validation_alias="DATABASE_URL")
-    oracle_db_user: str | None = Field(default=None, validation_alias="ORACLE_DB_USER")
-    oracle_db_password: str | None = Field(
-        default=None, validation_alias="ORACLE_DB_PASSWORD"
-    )
-    oracle_db_dsn: str | None = Field(default=None, validation_alias="ORACLE_DB_DSN")
+    # Oracle 23ai — required, no fallback
+    oracle_db_user: str = Field(..., validation_alias="ORACLE_DB_USER")
+    oracle_db_password: str = Field(..., validation_alias="ORACLE_DB_PASSWORD")
+    oracle_db_dsn: str = Field(..., validation_alias="ORACLE_DB_DSN")
     oracle_thick_mode: bool = Field(default=False, validation_alias="ORACLE_THICK_MODE")
     oracle_client_lib_dir: str | None = Field(
         default=None, validation_alias="ORACLE_CLIENT_LIB_DIR"
     )
-    sqlite_fallback_url: str = Field(
-        default="sqlite+aiosqlite:///./app/fallback_development.db",
-        validation_alias="SQLITE_FALLBACK_URL",
-    )
 
-    azure_openai_api_key: str = Field(default="", validation_alias="AZURE_OPENAI_API_KEY")
-    azure_openai_endpoint: str = Field(
-        default="", validation_alias="AZURE_OPENAI_ENDPOINT"
-    )
+    # Azure OpenAI — required for LLM extraction and RAG
+    azure_openai_api_key: str = Field(..., validation_alias="AZURE_OPENAI_API_KEY")
+    azure_openai_endpoint: str = Field(..., validation_alias="AZURE_OPENAI_ENDPOINT")
     azure_openai_deployment_name: str = Field(
         default="gpt-4o", validation_alias="AZURE_OPENAI_DEPLOYMENT_NAME"
     )
@@ -71,49 +61,11 @@ class Settings(BaseSettings):
         return ["*"]
 
     def resolved_database_url(self) -> str:
-        if self.database_backend == "sqlite":
-            return self.resolved_sqlite_url()
-
-        if self.database_url:
-            return self.database_url
-
-        if self.database_backend == "oracle26ai" or (
-            self.oracle_db_user and self.oracle_db_password and self.oracle_db_dsn
-        ):
-            missing = [
-                name
-                for name, value in {
-                    "ORACLE_DB_USER": self.oracle_db_user,
-                    "ORACLE_DB_PASSWORD": self.oracle_db_password,
-                    "ORACLE_DB_DSN": self.oracle_db_dsn,
-                }.items()
-                if not value
-            ]
-            if missing:
-                raise ValueError(
-                    "Oracle 26ai backend requires: " + ", ".join(missing)
-                )
-            return (
-                "oracle+oracledb_async://"
-                f"{self.oracle_db_user}:{self.oracle_db_password}@/?dsn={self.oracle_db_dsn}"
-            )
-
-        return self.resolved_sqlite_url()
-
-    def resolved_sqlite_url(self) -> str:
-        prefix = "sqlite+aiosqlite:///"
-        if not self.sqlite_fallback_url.startswith(prefix):
-            return self.sqlite_fallback_url
-
-        path_part = self.sqlite_fallback_url.removeprefix(prefix)
-        is_windows_absolute = len(path_part) > 1 and path_part[1] == ":"
-        is_posix_absolute = path_part.startswith("/")
-        if is_windows_absolute or is_posix_absolute:
-            return self.sqlite_fallback_url
-
-        relative_path = path_part[2:] if path_part.startswith("./") else path_part
-        absolute_path = (self.backend_root / relative_path).resolve()
-        return f"{prefix}{absolute_path.as_posix()}"
+        return (
+            "oracle+oracledb_async://"
+            f"{self.oracle_db_user}:{self.oracle_db_password}"
+            f"@/?dsn={self.oracle_db_dsn}"
+        )
 
 
 settings = Settings(
