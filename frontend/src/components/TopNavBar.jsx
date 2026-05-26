@@ -30,6 +30,9 @@ const TopNavBar = () => {
           <Link to="/repository" className={getTabClass('/repository')}>
             Repository
           </Link>
+          <Link to="/assistant" className={getTabClass('/assistant')}>
+            Assistant
+          </Link>
           <Link to="/approvals" className={getTabClass('/approvals')}>
             Approvals
           </Link>

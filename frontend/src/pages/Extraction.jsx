@@ -2,6 +2,16 @@ import React, { useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import useExtraction from '../hooks/useExtraction';
 
+const escapeHtml = (value = '') =>
+  String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+
+const escapeRegExp = (value = '') => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 const Extraction = () => {
   const navigate = useNavigate();
   const {
@@ -28,6 +38,25 @@ const Extraction = () => {
     const raw = contract?.document_text || '';
     return raw.length > 6000 ? `${raw.slice(0, 6000)}\n\n...` : raw;
   }, [contract?.document_text]);
+
+  const highlightedPreview = useMemo(() => {
+    const fallbackText = documentPreview || 'No text extracted from document.';
+    const citation = selectedParameter?.citation_text?.trim();
+    const safeText = escapeHtml(fallbackText).replaceAll('\n', '<br />');
+
+    if (!citation || !documentPreview) {
+      return safeText;
+    }
+
+    const regex = new RegExp(escapeRegExp(citation), 'i');
+    if (!regex.test(documentPreview)) {
+      return safeText;
+    }
+
+    return escapeHtml(documentPreview)
+      .replace(regex, (match) => `<mark class="bg-amber-200 text-slate-900 px-1 rounded">${escapeHtml(match)}</mark>`)
+      .replaceAll('\n', '<br />');
+  }, [documentPreview, selectedParameter?.citation_text]);
 
   return (
     <div className="flex flex-col gap-lg w-full min-h-screen">
@@ -59,9 +88,10 @@ const Extraction = () => {
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-lg">
           <div className="bg-surface-container-lowest border border-outline-variant rounded-xl p-lg">
             <h2 className="font-bold text-primary mb-sm">Document Text</h2>
-            <pre className="whitespace-pre-wrap text-xs leading-relaxed bg-surface p-sm rounded border border-outline-variant max-h-[640px] overflow-auto">
-              {documentPreview || 'No text extracted from document.'}
-            </pre>
+            <pre
+              className="whitespace-pre-wrap text-xs leading-relaxed bg-surface p-sm rounded border border-outline-variant max-h-[640px] overflow-auto"
+              dangerouslySetInnerHTML={{ __html: highlightedPreview }}
+            />
             {selectedParameter?.citation_text ? (
               <div className="mt-sm p-sm border border-primary rounded bg-primary-fixed/20">
                 <p className="text-xs font-bold text-primary">Selected Citation</p>
@@ -95,6 +125,9 @@ const Extraction = () => {
                     <p className="text-xs text-on-surface-variant">
                       Match Score: {param.match_score ?? 0}
                     </p>
+                    {param.source_query ? (
+                      <p className="text-xs text-on-surface-variant">Source Query: {param.source_query}</p>
+                    ) : null}
                     <p className="text-xs mt-xs">{param.user_override || param.original_extract || 'No match'}</p>
                     {selectedParamId === param.parameter_id ? (
                       <textarea

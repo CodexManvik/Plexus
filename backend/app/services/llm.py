@@ -24,7 +24,7 @@ class AzureOpenAIService:
         Sends an asynchronous POST request to the Azure OpenAI completion API.
         If credentials are empty, returns an empty completion.
         """
-        if not self.api_key or not self.endpoint:
+        if not self.api_key or not self.endpoint or not self.deployment_name or not self.api_version:
             print("[Azure OpenAI] Credentials missing. Returning empty completion.", file=sys.stderr)
             return ""
 

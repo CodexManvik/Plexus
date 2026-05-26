@@ -24,20 +24,56 @@ def _read_json_file(file_name: str) -> List[Dict[str, Any]]:
     return []
 
 
+async def _seed_master_rules(session: AsyncSession) -> None:
+    existing = {
+        (row.contract_type, row.agreement_type, row.parameter_head, row.parameter_name)
+        for row in (
+            await session.execute(
+                select(
+                    MasterExtractionRule.contract_type,
+                    MasterExtractionRule.agreement_type,
+                    MasterExtractionRule.parameter_head,
+                    MasterExtractionRule.parameter_name,
+                )
+            )
+        ).all()
+    }
+
+    rows: List[MasterExtractionRule] = []
+    for rule in _read_json_file("default_master_rules.json"):
+        key = (
+            rule.get("contract_type"),
+            rule.get("agreement_type"),
+            rule.get("parameter_head"),
+            rule.get("parameter_name"),
+        )
+        if key not in existing:
+            rows.append(MasterExtractionRule(**rule))
+
+    if rows:
+        session.add_all(rows)
+
+
+async def _seed_metadata_options(session: AsyncSession) -> None:
+    existing = {
+        (row.category, row.value)
+        for row in (
+            await session.execute(select(MetadataOption.category, MetadataOption.value))
+        ).all()
+    }
+
+    rows: List[MetadataOption] = []
+    for option in _read_json_file("default_metadata_options.json"):
+        key = (option.get("category"), option.get("value"))
+        if key not in existing:
+            rows.append(MetadataOption(**option))
+
+    if rows:
+        session.add_all(rows)
+
+
 async def seed_defaults(session: AsyncSession) -> None:
-    rule_count = (
-        await session.execute(select(MasterExtractionRule.rule_id).limit(1))
-    ).scalar_one_or_none()
-    metadata_count = (
-        await session.execute(select(MetadataOption.option_id).limit(1))
-    ).scalar_one_or_none()
-
-    if rule_count is None:
-        for rule in _read_json_file("default_master_rules.json"):
-            session.add(MasterExtractionRule(**rule))
-
-    if metadata_count is None:
-        for option in _read_json_file("default_metadata_options.json"):
-            session.add(MetadataOption(**option))
+    await _seed_master_rules(session)
+    await _seed_metadata_options(session)
 
     await session.commit()

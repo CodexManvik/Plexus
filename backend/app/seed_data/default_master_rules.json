@@ -1,37 +1,145 @@
 [
   {
-    "contract_type": "MSA",
-    "agreement_type": "Commercial",
-    "parameter_head": "Commercial Terms",
-    "parameter_name": "Scope of Services",
-    "parameter_logic": "P1 + P2 + P3",
-    "is_active": true,
-    "created_by": "system-seed"
-  },
-  {
-    "contract_type": "MSA",
-    "agreement_type": "Commercial",
-    "parameter_head": "Risk",
-    "parameter_name": "Limitation of Liability",
-    "parameter_logic": "P4 + P5",
+    "contract_type": "NDA",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Confidentiality & Data Handling",
+    "parameter_name": "Confidential Information Definition",
+    "parameter_logic": "confidential non disclosure secret proprietary",
     "is_active": true,
     "created_by": "system-seed"
   },
   {
     "contract_type": "NDA",
-    "agreement_type": "Commercial",
-    "parameter_head": "Confidentiality",
-    "parameter_name": "Confidentiality Duration",
-    "parameter_logic": "P1 + P10",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Legal & Compliance Terms",
+    "parameter_name": "Confidentiality Obligations",
+    "parameter_logic": "confidentiality obligations disclosure restrictions",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "MSA",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Scope of Work",
+    "parameter_name": "Description of Services / Deliverables",
+    "parameter_logic": "scope services deliverables work statement",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "MSA",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Risk, Liability & Indemnity",
+    "parameter_name": "Limitation of Liability",
+    "parameter_logic": "liability cap exclusions consequential damages",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "MSA",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Commercial & Financial Terms",
+    "parameter_name": "Payment Terms",
+    "parameter_logic": "payment terms invoice net 30 net 60 consideration",
     "is_active": true,
     "created_by": "system-seed"
   },
   {
     "contract_type": "SOW",
-    "agreement_type": "Internal",
-    "parameter_head": "Dates",
-    "parameter_name": "Effective Date",
-    "parameter_logic": "P1",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Operational & Execution Parameters",
+    "parameter_name": "Implementation Timeline",
+    "parameter_logic": "implementation timeline milestones delivery plan",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "SLA",
+    "agreement_type": "Technology & IT Contracts",
+    "parameter_head": "Penalties & Performance Metrics",
+    "parameter_name": "SLA Metrics",
+    "parameter_logic": "uptime response time service levels kpi",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "SLA",
+    "agreement_type": "Technology & IT Contracts",
+    "parameter_head": "Penalties & Performance Metrics",
+    "parameter_name": "Service Credits",
+    "parameter_logic": "service credits penalty liquidated damages escalation",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Employment Agreement",
+    "agreement_type": "Employment & HR Contracts",
+    "parameter_head": "Parties & Stakeholders",
+    "parameter_name": "Roles / Responsibilities",
+    "parameter_logic": "employee employer roles responsibilities duties",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Employment Agreement",
+    "agreement_type": "Employment & HR Contracts",
+    "parameter_head": "Special Clauses",
+    "parameter_name": "Non-compete / Non-solicitation",
+    "parameter_logic": "non compete non solicitation exclusivity",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Loan Agreement",
+    "agreement_type": "Banking & Finance Contracts",
+    "parameter_head": "Commercial & Financial Terms",
+    "parameter_name": "Repayment Terms",
+    "parameter_logic": "repayment interest principal instalment due date",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Lease Agreement",
+    "agreement_type": "Real Estate & Infrastructure",
+    "parameter_head": "Contract Dates",
+    "parameter_name": "Renewal Terms",
+    "parameter_logic": "renewal term expiry notice period lease",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Software License Agreement",
+    "agreement_type": "Technology & IT Contracts",
+    "parameter_head": "Special Clauses",
+    "parameter_name": "Licensing Terms",
+    "parameter_logic": "license usage restrictions software ip rights",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Data Processing Agreement",
+    "agreement_type": "Technology & IT Contracts",
+    "parameter_head": "Confidentiality & Data Handling",
+    "parameter_name": "Data Storage / Processing Locations",
+    "parameter_logic": "data storage processing location breach retention",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "EPC (Engineering, Procurement, Construction) Contract",
+    "agreement_type": "Construction & EPC Contracts",
+    "parameter_head": "Scope of Work",
+    "parameter_name": "Deliverables List",
+    "parameter_logic": "engineering procurement construction deliverables",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Import/Export Agreement",
+    "agreement_type": "International Trade Contracts",
+    "parameter_head": "Delivery & Logistics",
+    "parameter_name": "Delivery Terms",
+    "parameter_logic": "incoterms shipping customs delivery risk transfer",
     "is_active": true,
     "created_by": "system-seed"
   }

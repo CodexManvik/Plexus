@@ -36,7 +36,7 @@ const Upload = () => {
       <div>
         <h1 className="text-3xl font-black text-primary tracking-tight">Contract Upload & Intake</h1>
         <p className="text-sm text-on-surface-variant font-medium">
-          Upload a PDF, Word, or Excel contract and tag all required metadata before extraction.
+          Upload a PDF, Word, or Excel contract and tag the contract family plus specific type before extraction.
         </p>
       </div>
 
@@ -118,8 +118,8 @@ const Upload = () => {
             <input className={fieldClass} placeholder="Department" value={metadata.department} onChange={(e) => updateMetadata('department', e.target.value)} list="department-options" />
             <input className={fieldClass} placeholder="Customer / Partner Name" value={metadata.customer_partner_name} onChange={(e) => updateMetadata('customer_partner_name', e.target.value)} list="customer-options" />
             <input className={fieldClass} placeholder="Financial Year" value={metadata.financial_year} onChange={(e) => updateMetadata('financial_year', e.target.value)} list="financial-year-options" />
-            <input className={fieldClass} placeholder="Contract Type *" value={metadata.contract_type} onChange={(e) => updateMetadata('contract_type', e.target.value)} list="contract-type-options" />
-            <input className={fieldClass} placeholder="Agreement Type *" value={metadata.agreement_type} onChange={(e) => updateMetadata('agreement_type', e.target.value)} list="agreement-type-options" />
+            <input className={fieldClass} placeholder="Specific Contract Type *" value={metadata.contract_type} onChange={(e) => updateMetadata('contract_type', e.target.value)} list="contract-type-options" />
+            <input className={fieldClass} placeholder="Contract Family *" value={metadata.agreement_type} onChange={(e) => updateMetadata('agreement_type', e.target.value)} list="agreement-type-options" />
             <input className={fieldClass} placeholder="Contract Number / Reference ID" value={metadata.contract_number} onChange={(e) => updateMetadata('contract_number', e.target.value)} />
             <input className={fieldClass} placeholder="Version / Amendment Number" value={metadata.version_amendment_number} onChange={(e) => updateMetadata('version_amendment_number', e.target.value)} />
             <input className={fieldClass} placeholder="Execution Type" value={metadata.execution_type} onChange={(e) => updateMetadata('execution_type', e.target.value)} list="execution-type-options" />

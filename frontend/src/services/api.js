@@ -77,6 +77,8 @@ export const api = {
   addParameterBySearch: async (contractId, payload) =>
     getData(apiClient.post(`/contracts/${contractId}/search-add`, payload)),
 
+  askAssistant: async (payload) => getData(apiClient.post('/assistant/query', payload)),
+
   submitDraft: async (contractId, payload) =>
     getData(apiClient.post(`/contracts/${contractId}/submit-draft`, payload)),
 

@@ -14,7 +14,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine, get_database_driver
-from app.routes import contracts, dashboard, maintenance, metadata, rules, verification
+from app.routes import assistant, contracts, dashboard, maintenance, metadata, rules, verification
 from app.services.bootstrap import seed_defaults
 
 
@@ -103,6 +103,7 @@ app.add_middleware(
 
 app.include_router(contracts.router, prefix=settings.api_prefix)
 app.include_router(dashboard.router, prefix=settings.api_prefix)
+app.include_router(assistant.router, prefix=settings.api_prefix)
 app.include_router(rules.router, prefix=settings.api_prefix)
 app.include_router(metadata.router, prefix=settings.api_prefix)
 app.include_router(verification.router, prefix=settings.api_prefix)

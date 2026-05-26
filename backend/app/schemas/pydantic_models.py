@@ -99,6 +99,31 @@ class ContractSearchResponse(BaseModel):
     total: int
 
 
+class AssistantSourceSnippet(BaseModel):
+    contract_id: str
+    contract_type: Optional[str] = None
+    agreement_type: Optional[str] = None
+    source_type: str
+    title: Optional[str] = None
+    snippet: str
+    score: float
+    parameter_head: Optional[str] = None
+    parameter_name: Optional[str] = None
+
+
+class AssistantQueryRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000)
+    contract_ids: List[str] = Field(default_factory=list)
+    top_k: int = Field(default=3, ge=1, le=5)
+
+
+class AssistantQueryResponse(BaseModel):
+    answer: str
+    contract_ids: List[str]
+    sources: List[AssistantSourceSnippet] = Field(default_factory=list)
+    used_llm: bool = False
+
+
 class ContractUpdateMetadataRequest(BaseModel):
     metadata: MetadataFields
     modified_by: str

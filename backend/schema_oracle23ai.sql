@@ -106,7 +106,7 @@ CREATE TABLE contract_parameters_extracted (
     citation_text      CLOB,
     citation_start     NUMBER,
     citation_end       NUMBER,
-    spatial_json       CLOB,
+    spatial_json       JSON,
     vector_embed       CLOB,
     source_query       VARCHAR2(250),
     is_user_added      NUMBER(1) DEFAULT 0 NOT NULL,

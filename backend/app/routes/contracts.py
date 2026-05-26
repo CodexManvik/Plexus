@@ -290,6 +290,8 @@ async def upload_contract(
             rules=[_build_rule_payload(rule) for rule in active_rules],
         )
         for item in extracted_params:
+            if not item.get("original_extract"):
+                continue
             db.add(
                 ContractParameterExtracted(
                     contract_id=contract_id,
@@ -602,6 +604,9 @@ async def add_parameter_from_search(
         ],
     )
     item = extracted[0]
+    if not item.get("original_extract"):
+        raise HTTPException(status_code=422, detail="The search terms did not match any text in the document.")
+
     parameter = ContractParameterExtracted(
         contract_id=contract_id,
         header_name=item["header_name"],
