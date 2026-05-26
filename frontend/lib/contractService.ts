@@ -14,6 +14,7 @@ export type ParameterResponse = {
     original_extract?: string | null;
     user_override?: string | null;
     combined_score?: number | null;
+    spatial_json?: SpatialBox | null; 
 };
 
 export type SpatialBox = {
@@ -27,9 +28,6 @@ export type SpatialBox = {
 };
 
 export type ContractParameter = ParameterResponse & {
-    spatial_json?: SpatialBox | null;
-    param_group_id?: string | null;
-    param_structure_type?: string | null;
     verified?: boolean;
 };
 
@@ -38,126 +36,91 @@ export type BatchAcceptResult = {
     applyTo: (rows: ContractParameter[]) => ContractParameter[];
 };
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:8000";
+
+function ensureOk(response: Response) {
+    if (!response.ok) {
+        throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
+    }
+}
+
+function alertOnConflict() {
+    alert("This contract was modified by another user. Please refresh to see the latest version.");
+}
+
+// 1. Create a fresh contract ledger in PostgreSQL
+export async function createContract(contractType: string = "General Agreement"): Promise<ContractVersionResponse> {
+    const id = "DOC-" + Math.random().toString(36).substring(2, 9).toUpperCase();
+    const response = await fetch(`${API_BASE_URL}/contracts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            contract_id: id,
+            contract_type: contractType,
+            workflow_state: "STAGED_DRAFT"
+        })
+    });
+    ensureOk(response);
+    return response.json();
+}
+
+// 2. Feed text to local Llama 3 to get structured JSON parameters
+// 2. Feed text to local Llama 3 to get structured JSON parameters
+export async function extractContractParameters(contractId: string, text: string): Promise<ContractParameter[]> {
+    const requestBody = {
+        contract_text: text,
+        parameters: [
+            "Governing Law",
+            "Limitation of Liability",
+            "Effective Date",
+            "Payment Terms",
+            "Confidentiality Requirements"
+        ]
+    };
+    
+    // FIX: Removed "/versions/1" to match the FastAPI main.py router exactly
+    const response = await fetch(`${API_BASE_URL}/contracts/${contractId}/extract`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody)
+    });
+    
+    ensureOk(response);
+    return response.json();
+}
+
+// 3. Save operator edits to the database
+export async function updateParameterOverride(parameterId: number, userOverride: string): Promise<ParameterResponse> {
+    const response = await fetch(`${API_BASE_URL}/parameters/${parameterId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_override: userOverride })
+    });
+    ensureOk(response);
+    return response.json();
+}
 
 function applyBatchApprovalToState(rows: ContractParameter[]): ContractParameter[] {
     return rows.map((row) => {
         const hasOverride = row.user_override && row.user_override.trim().length > 0;
-        const score = row.combined_score ?? 0;
-        if (hasOverride || score < 0.99) {
-            return row;
-        }
-
+        if (hasOverride) return row; // Protect human edits
         return {
             ...row,
-            user_override: row.original_extract ?? row.user_override ?? "",
-            combined_score: 1.0,
+            user_override: row.original_extract,
             verified: true,
+            combined_score: 1.0,
         };
     });
-}
-
-function buildHeaders(etag?: string): Record<string, string> {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (etag) {
-        headers["If-Match"] = etag;
-    }
-    return headers;
-}
-
-function ensureOk(response: Response): void {
-    if (!response.ok) {
-        const error = new Error(`Request failed with status ${response.status}`);
-        (error as Error & { status?: number }).status = response.status;
-        throw error;
-    }
-}
-
-function alertOnConflict(): void {
-    if (typeof window !== "undefined") {
-        window.alert("This record was updated elsewhere. Please refresh to get the latest _etag.");
-    }
-}
-
-export async function fetchContractVersion(
-    contractId: string,
-    versionNumber: number,
-): Promise<ContractVersionResponse> {
-    try {
-        const response = await fetch(
-            `${API_BASE_URL}/contracts/${contractId}/versions/${versionNumber}`,
-            { method: "GET", headers: { "Content-Type": "application/json" } },
-        );
-        if (response.status === 409) {
-            alertOnConflict();
-            throw new Error("Conflict");
-        }
-        ensureOk(response);
-        return (await response.json()) as ContractVersionResponse;
-    } catch (error) {
-        if ((error as Error & { status?: number }).status === 409) {
-            alertOnConflict();
-        }
-        throw error;
-    }
-}
-
-export async function fetchContractParameters(
-    contractId: string,
-    versionNumber: number,
-): Promise<ContractParameter[]> {
-    try {
-        const response = await fetch(
-            `${API_BASE_URL}/contracts/${contractId}/versions/${versionNumber}/parameters`,
-            { method: "GET", headers: { "Content-Type": "application/json" } },
-        );
-        if (response.status === 409) {
-            alertOnConflict();
-            throw new Error("Conflict");
-        }
-        ensureOk(response);
-        return (await response.json()) as ContractParameter[];
-    } catch (error) {
-        if ((error as Error & { status?: number }).status === 409) {
-            alertOnConflict();
-        }
-        throw error;
-    }
-}
-
-export async function updateParameterOverride(
-    parameterId: number,
-    userOverride: string,
-): Promise<ParameterResponse> {
-    try {
-        const response = await fetch(`${API_BASE_URL}/parameters/${parameterId}`, {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ user_override: userOverride }),
-        });
-        if (response.status === 409) {
-            alertOnConflict();
-            throw new Error("Conflict");
-        }
-        ensureOk(response);
-        return (await response.json()) as ParameterResponse;
-    } catch (error) {
-        if ((error as Error & { status?: number }).status === 409) {
-            alertOnConflict();
-        }
-        throw error;
-    }
 }
 
 export async function submitBatchApproval(
     contractId: string,
     versionNumber: number,
-    etag?: string,
 ): Promise<BatchAcceptResult> {
     try {
         const response = await fetch(
             `${API_BASE_URL}/contracts/${contractId}/versions/${versionNumber}/batch-accept`,
-            { method: "POST", headers: buildHeaders(etag) },
+            { method: "POST", headers: { "Content-Type": "application/json" } },
         );
         if (response.status === 409) {
             alertOnConflict();
@@ -170,38 +133,7 @@ export async function submitBatchApproval(
             applyTo: applyBatchApprovalToState,
         };
     } catch (error) {
-        if ((error as Error & { status?: number }).status === 409) {
-            alertOnConflict();
-        }
-        throw error;
-    }
-}
-
-export async function triggerStateTransition(
-    contractId: string,
-    action: "submit" | "approve",
-    etag?: string,
-): Promise<ContractVersionResponse> {
-    const endpoint =
-        action === "submit"
-            ? `${API_BASE_URL}/contracts/${contractId}/submit-for-approval`
-            : `${API_BASE_URL}/contracts/${contractId}/approve`;
-
-    try {
-        const response = await fetch(endpoint, {
-            method: "POST",
-            headers: buildHeaders(etag),
-        });
-        if (response.status === 409) {
-            alertOnConflict();
-            throw new Error("Conflict");
-        }
-        ensureOk(response);
-        return (await response.json()) as ContractVersionResponse;
-    } catch (error) {
-        if ((error as Error & { status?: number }).status === 409) {
-            alertOnConflict();
-        }
+        if ((error as Error & { status?: number }).status === 409) alertOnConflict();
         throw error;
     }
 }

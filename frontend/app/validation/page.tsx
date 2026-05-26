@@ -1,345 +1,217 @@
 "use client";
 
-import { useEffect, useMemo, useState, type ChangeEvent } from "react";
-import { useSearchParams } from "next/navigation";
-
+import { useState } from "react";
+import * as pdfjsLib from "pdfjs-dist";
 import ContractValidationWorkspace from "../../components/ContractValidationWorkspace";
 import {
-  type ContractParameter,
-  type ContractVersionResponse,
-  fetchContractParameters,
-  fetchContractVersion,
-  submitBatchApproval,
-  triggerStateTransition,
-  updateParameterOverride,
+    type ContractParameter,
+    createContract,
+    extractContractParameters,
+    updateParameterOverride,
+    submitBatchApproval
 } from "../../lib/contractService";
 
-const DEFAULT_PDF = "/sample.pdf";
+pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
 export default function ValidationPage() {
-  const searchParams = useSearchParams();
-  const contractId = searchParams.get("contractId")?.trim() ?? "";
-  const versionParam = searchParams.get("version") ?? "1";
-  const queryPdf = searchParams.get("pdf");
+    const [pdfFile, setPdfFile] = useState<File | null>(null);
+    const [pdfUrl, setPdfUrl] = useState<string | null>(null);
+    const [parameters, setParameters] = useState<ContractParameter[]>([]);
+    const [isUploading, setIsUploading] = useState(false);
+    const [contractId, setContractId] = useState<string | null>(null);
 
-  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
-  const [uploadedPdfUrl, setUploadedPdfUrl] = useState<string | null>(null);
-  const [pdfUrlState, setPdfUrlState] = useState<string>(queryPdf ?? DEFAULT_PDF);
-
-  useEffect(() => {
-    const query = searchParams.get("pdf");
-    if (!uploadedFile) {
-      setPdfUrlState(query ?? DEFAULT_PDF);
-    }
-  }, [searchParams, uploadedFile]);
-
-  useEffect(() => {
-    return () => {
-      if (uploadedPdfUrl?.startsWith("blob:")) {
-        URL.revokeObjectURL(uploadedPdfUrl);
-      }
-    };
-  }, [uploadedPdfUrl]);
-
-  const pdfUrl = uploadedPdfUrl ?? pdfUrlState;
-
-  const versionNumber = useMemo(() => {
-    const parsed = Number(versionParam);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
-  }, [versionParam]);
-
-  const [version, setVersion] = useState<ContractVersionResponse | null>(null);
-  const [parameters, setParameters] = useState<ContractParameter[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!contractId) {
-      setVersion(null);
-      setParameters([]);
-      return;
-    }
-    let cancelled = false;
-
-    const load = async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const [versionData, paramRows] = await Promise.all([
-          fetchContractVersion(contractId, versionNumber),
-          fetchContractParameters(contractId, versionNumber),
-        ]);
-        if (!cancelled) {
-          setVersion(versionData);
-          setParameters(paramRows);
+    const extractTextFromPdf = async (file: File) => {
+        const arrayBuffer = await file.arrayBuffer();
+        const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+        let fullText = "";
+        for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            const textContent = await page.getTextContent();
+            const pageText = textContent.items.map((item: any) => item.str).join(" ");
+            fullText += pageText + "\n\n";
         }
-      } catch (err) {
-        if (!cancelled) {
-          setError((err as Error).message || "Failed to load contract data");
-        }
-      } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      }
+        return fullText;
     };
 
-    load();
-    return () => {
-      cancelled = true;
+    const onFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        if (!file) return;
+
+        setPdfFile(file);
+        setPdfUrl(URL.createObjectURL(file));
+        setIsUploading(true);
+
+        try {
+            // 1. Client-side layout text scrape
+            const text = await extractTextFromPdf(file);
+            
+            // 2. Setup Database ledger object
+            const contract = await createContract("Uploaded Agreement");
+            setContractId(contract.contract_id);
+            
+            // 3. Pipe to local Llama 3 via FastAPI
+            const extractedParams = await extractContractParameters(contract.contract_id, text);
+            setParameters(extractedParams);
+        } catch (error) {
+            console.error("Extraction failed:", error);
+            alert("Extraction failed. Ensure your FastAPI backend (Port 8000) and Llama server (Port 8080) are active.");
+        } finally {
+            setIsUploading(false);
+        }
     };
-  }, [contractId, versionNumber]);
 
-  const handleOverrideChange = async (parameterId: number, value: string) => {
-    try {
-      const updated = await updateParameterOverride(parameterId, value);
-      setParameters((prev) =>
-        prev.map((row) =>
-          row.parameter_id === parameterId
-            ? {
-                ...row,
-                user_override: updated.user_override ?? value,
-                combined_score: updated.combined_score ?? row.combined_score,
-              }
-            : row,
-        ),
-      );
-    } catch (err) {
-      setError((err as Error).message || "Failed to update parameter");
-    }
-  };
+    const handleOverrideChange = async (parameterId: number, value: string) => {
+        try {
+            await updateParameterOverride(parameterId, value); // Save specific edit to Postgres
+        } catch (error) {
+            console.error("Failed to save override:", error);
+        }
+    };
 
-  const handlePdfUpload = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) {
-      return;
-    }
+    const handleBatchAccept = async () => {
+        if (!contractId) return;
+        try {
+            const result = await submitBatchApproval(contractId, 1);
+            setParameters(result.applyTo(parameters));
+            alert(`Successfully batch-verified ${result.updated} unchanged parameters.`);
+        } catch (error) {
+            console.error("Batch accept failed:", error);
+        }
+    };
 
-    if (file.type !== "application/pdf") {
-      setError("Please upload a PDF file.");
-      return;
-    }
+    return (
+        <div className="container">
+            <header className="header">
+                <h1>Contract Validation Workspace</h1>
+                {parameters.length > 0 && (
+                    <div className="header-actions">
+                        <button className="btn-secondary" onClick={handleBatchAccept}>
+                            Batch Accept Unchanged
+                        </button>
+                        <button className="btn-primary" onClick={() => alert("Forwarded to Operation Head!")}>
+                            Submit for Approval
+                        </button>
+                    </div>
+                )}
+            </header>
 
-    setError(null);
-    setUploadedFile(file);
+            {!pdfFile && (
+                <div className="upload-zone">
+                    <input type="file" accept="application/pdf" onChange={onFileUpload} id="pdf-upload" />
+                    <label htmlFor="pdf-upload" className="upload-label">
+                        <div className="upload-icon">📄</div>
+                        <span>Drag & Drop PDF or Click to Browse</span>
+                    </label>
+                </div>
+            )}
 
-    if (uploadedPdfUrl?.startsWith("blob:")) {
-      URL.revokeObjectURL(uploadedPdfUrl);
-    }
+            {isUploading && (
+                <div className="loading-state">
+                    <div className="spinner"></div>
+                    <p>Llama 3 is analyzing document layout & extracting parameters locally...</p>
+                </div>
+            )}
 
-    setUploadedPdfUrl(URL.createObjectURL(file));
-  };
+            {pdfUrl && !isUploading && parameters.length > 0 && (
+                <ContractValidationWorkspace
+                    pdfUrl={pdfUrl}
+                    parameters={parameters}
+                    onOverrideChange={handleOverrideChange}
+                />
+            )}
 
-  const clearUploadedPdf = () => {
-    if (uploadedPdfUrl?.startsWith("blob:")) {
-      URL.revokeObjectURL(uploadedPdfUrl);
-    }
-    setUploadedFile(null);
-    setUploadedPdfUrl(null);
-    setPdfUrlState(queryPdf ?? DEFAULT_PDF);
-  };
-
-  const handleBatchAccept = async () => {
-    if (!version) {
-      return;
-    }
-    try {
-      const result = await submitBatchApproval(
-        version.contract_id,
-        version.version_number,
-        version.etag,
-      );
-      setParameters((prev) => result.applyTo(prev));
-    } catch (err) {
-      setError((err as Error).message || "Batch accept failed");
-    }
-  };
-
-  const handleTransition = async (action: "submit" | "approve") => {
-    if (!version) {
-      return;
-    }
-    try {
-      const next = await triggerStateTransition(version.contract_id, action, version.etag);
-      setVersion(next);
-    } catch (err) {
-      setError((err as Error).message || "State transition failed");
-    }
-  };
-
-  return (
-    <div className="validation-shell">
-      <header className="validation-header">
-        <div>
-          <h1>Contract Validation</h1>
-          <p>
-            Contract <strong>{contractId || "—"}</strong> · Version {versionNumber}
-          </p>
-          {version && <span className="state">{version.workflow_state}</span>}
+            <style jsx>{`
+                .container {
+                    max-width: 1600px;
+                    margin: 0 auto;
+                    padding: 2rem;
+                }
+                .header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    margin-bottom: 2rem;
+                }
+                h1 {
+                    font-size: 1.5rem;
+                    font-weight: 600;
+                    color: #0f172a;
+                }
+                .header-actions {
+                    display: flex;
+                    gap: 1rem;
+                }
+                button {
+                    padding: 0.5rem 1rem;
+                    border-radius: 6px;
+                    font-weight: 500;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                }
+                .btn-secondary {
+                    background: white;
+                    border: 1px solid #cbd5e1;
+                    color: #475569;
+                }
+                .btn-secondary:hover {
+                    background: #f8fafc;
+                }
+                .btn-primary {
+                    background: #2563eb;
+                    border: none;
+                    color: white;
+                }
+                .btn-primary:hover {
+                    background: #1d4ed8;
+                }
+                .upload-zone {
+                    border: 2px dashed #cbd5e1;
+                    border-radius: 12px;
+                    padding: 4rem 2rem;
+                    text-align: center;
+                    background: #f8fafc;
+                    transition: border-color 0.2s;
+                }
+                .upload-zone:hover {
+                    border-color: #94a3b8;
+                }
+                input[type="file"] {
+                    display: none;
+                }
+                .upload-label {
+                    cursor: pointer;
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    gap: 1rem;
+                    color: #475569;
+                    font-size: 1.1rem;
+                }
+                .upload-icon {
+                    font-size: 3rem;
+                }
+                .loading-state {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: center;
+                    gap: 1.5rem;
+                    padding: 4rem;
+                    color: #475569;
+                }
+                .spinner {
+                    width: 40px;
+                    height: 40px;
+                    border: 3px solid #e2e8f0;
+                    border-top-color: #2563eb;
+                    border-radius: 50%;
+                    animation: spin 1s linear infinite;
+                }
+                @keyframes spin {
+                    to {
+                        transform: rotate(360deg);
+                    }
+                }
+            `}</style>
         </div>
-
-        <div className="upload-area">
-          <label className="upload-button">
-            <input type="file" accept="application/pdf" onChange={handlePdfUpload} />
-            {uploadedFile ? `Uploaded: ${uploadedFile.name}` : "Upload PDF"}
-          </label>
-          {uploadedFile && (
-            <button type="button" className="clear-upload" onClick={clearUploadedPdf}>
-              Clear
-            </button>
-          )}
-        </div>
-
-        <div className="actions">
-          <button type="button" onClick={handleBatchAccept} disabled={!version || loading}>
-            Batch Accept
-          </button>
-          <button
-            type="button"
-            onClick={() => handleTransition("submit")}
-            disabled={!version || loading}
-          >
-            Submit
-          </button>
-          <button
-            type="button"
-            onClick={() => handleTransition("approve")}
-            disabled={!version || loading}
-          >
-            Approve
-          </button>
-        </div>
-      </header>
-
-      {error && <div className="error">{error}</div>}
-
-      <ContractValidationWorkspace
-        pdfUrl={pdfUrl}
-        parameters={parameters}
-        onOverrideChange={handleOverrideChange}
-      />
-
-      <style jsx>{`
-        .validation-shell {
-          min-height: 100vh;
-          background: #0b1222;
-        }
-
-        .validation-header {
-          display: grid;
-          grid-template-columns: minmax(0, 1fr) auto auto;
-          align-items: center;
-          padding: 16px 24px;
-          color: #f8fafc;
-          gap: 16px;
-          row-gap: 12px;
-        }
-
-        .validation-header h1 {
-          margin: 0;
-          font-size: 1.4rem;
-        }
-
-        .upload-area {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          flex-wrap: wrap;
-        }
-
-        .upload-button {
-          position: relative;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          padding: 10px 16px;
-          background: rgba(34, 197, 94, 0.18);
-          border: 1px solid rgba(34, 197, 94, 0.4);
-          color: #d9f99d;
-          border-radius: 999px;
-          cursor: pointer;
-          font-size: 0.95rem;
-          overflow: hidden;
-        }
-
-        .upload-button input {
-          position: absolute;
-          inset: 0;
-          width: 100%;
-          height: 100%;
-          opacity: 0;
-          cursor: pointer;
-        }
-
-        .clear-upload {
-          padding: 10px 16px;
-          border-radius: 999px;
-          border: 1px solid rgba(148, 163, 184, 0.4);
-          background: rgba(15, 23, 42, 0.85);
-          color: #f8fafc;
-          cursor: pointer;
-        }
-
-        .validation-header p {
-          margin: 4px 0 0;
-          color: rgba(226, 232, 240, 0.75);
-        }
-
-        .state {
-          display: inline-flex;
-          margin-top: 6px;
-          padding: 4px 10px;
-          border-radius: 999px;
-          background: rgba(14, 165, 233, 0.2);
-          color: #e0f2fe;
-          font-size: 0.75rem;
-          letter-spacing: 0.08em;
-          text-transform: uppercase;
-        }
-
-        .actions {
-          display: flex;
-          gap: 10px;
-        }
-
-        .actions button {
-          border: 1px solid rgba(148, 163, 184, 0.4);
-          background: rgba(15, 23, 42, 0.85);
-          color: #f8fafc;
-          padding: 8px 14px;
-          border-radius: 10px;
-          cursor: pointer;
-        }
-
-        .actions button:disabled {
-          opacity: 0.5;
-          cursor: not-allowed;
-        }
-
-        .error {
-          margin: 0 24px 12px;
-          padding: 10px 14px;
-          border-radius: 10px;
-          background: rgba(239, 68, 68, 0.2);
-          color: #fee2e2;
-        }
-
-        .validation-empty {
-          min-height: 100vh;
-          display: grid;
-          place-items: center;
-          text-align: center;
-          color: #e2e8f0;
-          background: #0b1222;
-          padding: 32px;
-        }
-
-        .validation-empty code {
-          background: rgba(148, 163, 184, 0.2);
-          padding: 2px 6px;
-          border-radius: 6px;
-        }
-      `}</style>
-    </div>
-  );
+    );
 }

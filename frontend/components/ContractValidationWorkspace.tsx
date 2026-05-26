@@ -350,7 +350,24 @@ export default function ContractValidationWorkspace({
                             <input
                                 className="field"
                                 value={row.user_override ?? ""}
-                                onChange={(event) => handleOverrideChange(row.parameter_id, event.target.value)}
+                                onChange={(event) => {
+                                    // Update local UI state immediately for responsive typing without hitting the API
+                                    setRows((prev) =>
+                                        prev.map((r) =>
+                                            r.parameter_id === row.parameter_id
+                                                ? { ...r, user_override: event.target.value }
+                                                : r
+                                        )
+                                    );
+                                }}
+                                onBlur={(event) => {
+                                    // Only trigger the PostgreSQL database save when you finish typing and click away
+                                    if (onOverrideChange) {
+                                        onOverrideChange(row.parameter_id, event.target.value);
+                                    }
+                                }}
+                                onFocus={() => handleRowActivate(row.parameter_id)}
+                                onMouseEnter={() => handleRowActivate(row.parameter_id)}
                             />
                         </div>
                     ))}
