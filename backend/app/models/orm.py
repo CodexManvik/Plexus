@@ -1,4 +1,7 @@
+import json
+
 from sqlalchemy import (
+    Identity,
     JSON,
     Boolean,
     Column,
@@ -13,14 +16,57 @@ from sqlalchemy import (
     func,
 )
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.oracle.base import ischema_names
+from sqlalchemy.types import TypeDecorator, UserDefinedType
 
 from app.database import Base
+
+
+class OracleJSONDDL(UserDefinedType):
+    cache_ok = True
+
+    def get_col_spec(self, **kw):
+        return "JSON"
+
+
+class OracleNativeJSON(TypeDecorator):
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "oracle":
+            return dialect.type_descriptor(OracleJSONDDL())
+        return dialect.type_descriptor(JSON())
+
+    def process_bind_param(self, value, dialect):
+        if value is None:
+            return None
+        if dialect.name != "oracle":
+            return value
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    def process_result_value(self, value, dialect):
+        if value is None:
+            return None
+        if hasattr(value, "read"):
+            value = value.read()
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            value = bytes(value).decode()
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+
+
+ischema_names["JSON"] = OracleJSONDDL
 
 
 class ContractMaster(Base):
     __tablename__ = "contracts_master"
 
-    contract_id = Column(String(50), primary_key=True, index=True)
+    contract_id = Column(String(50), primary_key=True)
     organization = Column(String(100), nullable=False)
     business_unit = Column(String(100), nullable=False)
     location = Column(String(100), nullable=True)
@@ -84,7 +130,7 @@ class ContractMaster(Base):
 class ContractParameterExtracted(Base):
     __tablename__ = "contract_parameters_extracted"
 
-    parameter_id = Column(Integer, primary_key=True, autoincrement=True)
+    parameter_id = Column(Integer, Identity(start=1), primary_key=True)
     contract_id = Column(
         String(50), ForeignKey("contracts_master.contract_id", ondelete="CASCADE"), nullable=False
     )
@@ -96,7 +142,7 @@ class ContractParameterExtracted(Base):
     citation_text = Column(Text, nullable=True)
     citation_start = Column(Integer, nullable=True)
     citation_end = Column(Integer, nullable=True)
-    spatial_json = Column(JSON, nullable=True)
+    spatial_json = Column(OracleNativeJSON(), nullable=True)
     vector_embed = Column(Text, nullable=True)
     source_query = Column(String(250), nullable=True)
     is_user_added = Column(Boolean, default=False, nullable=False)
@@ -110,7 +156,7 @@ class ContractParameterExtracted(Base):
 class ContractAuditTrail(Base):
     __tablename__ = "contract_audit_trail"
 
-    audit_id = Column(Integer, primary_key=True, autoincrement=True)
+    audit_id = Column(Integer, Identity(start=1), primary_key=True)
     contract_id = Column(
         String(50), ForeignKey("contracts_master.contract_id", ondelete="CASCADE"), nullable=False
     )
@@ -136,7 +182,7 @@ class MasterExtractionRule(Base):
         ),
     )
 
-    rule_id = Column(Integer, primary_key=True, autoincrement=True)
+    rule_id = Column(Integer, Identity(start=1), primary_key=True)
     contract_type = Column(String(100), nullable=False)
     agreement_type = Column(String(100), nullable=False)
     parameter_head = Column(String(150), nullable=False)
@@ -154,7 +200,7 @@ class MetadataOption(Base):
         UniqueConstraint("category", "value", name="uq_metadata_category_value"),
     )
 
-    option_id = Column(Integer, primary_key=True, autoincrement=True)
+    option_id = Column(Integer, Identity(start=1), primary_key=True)
     category = Column(String(80), nullable=False, index=True)
     value = Column(String(200), nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)

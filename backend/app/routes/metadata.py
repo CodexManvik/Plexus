@@ -27,7 +27,7 @@ async def _distinct_values(
         select(MetadataOption.value)
         .where(
             MetadataOption.category == category,
-            MetadataOption.is_active.is_(True),
+            MetadataOption.is_active == True,
         )
         .order_by(MetadataOption.value.asc())
     )
@@ -48,7 +48,7 @@ async def list_metadata_options(
     category: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    query = select(MetadataOption).where(MetadataOption.is_active.is_(True))
+    query = select(MetadataOption).where(MetadataOption.is_active == True)
     if category:
         query = query.where(MetadataOption.category == category)
     query = query.order_by(MetadataOption.category.asc(), MetadataOption.value.asc())

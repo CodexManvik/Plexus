@@ -24,7 +24,7 @@ async def list_active_rules(
 ):
     query = select(MasterExtractionRule)
     if not include_inactive:
-        query = query.where(MasterExtractionRule.is_active.is_(True))
+        query = query.where(MasterExtractionRule.is_active == True)
     if contract_type:
         query = query.where(MasterExtractionRule.contract_type == contract_type)
     if agreement_type:

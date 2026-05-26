@@ -22,3 +22,17 @@ backend/*.pyc
 backend/migrations/
 backend/app/*__pycache__/
 backend/app/*.pyc
+backend/*/*__pycache__/
+backend/*/*/*.pyc
+backend/app/models/__pycache__/
+backend/app/models/*.pyc
+backend/app/schemas/__pycache__/
+backend/app/schemas/*.pyc
+backend/app/services/__pycache__/
+backend/app/services/*.pyc
+backend/app/utils/__pycache__/
+backend/app/utils/*.pyc
+backend/app/controllers/__pycache__/
+backend/app/controllers/*.pyc
+backend/app/routes/__pycache__/
+backend/app/routes/*.pyc

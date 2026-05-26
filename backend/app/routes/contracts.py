@@ -170,7 +170,7 @@ async def _load_active_rules(
     exact = await db.execute(
         select(MasterExtractionRule).where(
             and_(
-                MasterExtractionRule.is_active.is_(True),
+                MasterExtractionRule.is_active == True,
                 MasterExtractionRule.contract_type == contract_type,
                 MasterExtractionRule.agreement_type == agreement_type,
             )
@@ -183,7 +183,7 @@ async def _load_active_rules(
     fallback = await db.execute(
         select(MasterExtractionRule).where(
             and_(
-                MasterExtractionRule.is_active.is_(True),
+                MasterExtractionRule.is_active == True,
                 MasterExtractionRule.contract_type == contract_type,
             )
         )

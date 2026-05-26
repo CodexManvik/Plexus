@@ -45,6 +45,13 @@ SQLITE_REQUIRED_COLUMNS = {
     "effective_date",
 }
 
+ORACLE_IDENTITY_REQUIRED_COLUMNS = {
+    "contract_parameters_extracted": {"parameter_id"},
+    "contract_audit_trail": {"audit_id"},
+    "master_extraction_rules": {"rule_id"},
+    "metadata_options": {"option_id"},
+}
+
 
 def _ensure_schema(sync_conn):
     inspector = inspect(sync_conn)
@@ -52,6 +59,16 @@ def _ensure_schema(sync_conn):
         existing_columns = {col["name"] for col in inspector.get_columns("contracts_master")}
         if not SQLITE_REQUIRED_COLUMNS.issubset(existing_columns):
             Base.metadata.drop_all(sync_conn)
+    elif sync_conn.dialect.name == "oracle":
+        for table_name, identity_columns in ORACLE_IDENTITY_REQUIRED_COLUMNS.items():
+            if not inspector.has_table(table_name):
+                continue
+            existing_columns = {
+                col["name"].lower(): col for col in inspector.get_columns(table_name)
+            }
+            if any(existing_columns.get(column, {}).get("identity") is None for column in identity_columns):
+                Base.metadata.drop_all(sync_conn)
+                break
     Base.metadata.create_all(sync_conn)
 
 
