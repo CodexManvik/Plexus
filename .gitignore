@@ -36,3 +36,4 @@ backend/app/controllers/__pycache__/
 backend/app/controllers/*.pyc
 backend/app/routes/__pycache__/
 backend/app/routes/*.pyc
+bge-large-en-v1.5-q4_k_m.gguf

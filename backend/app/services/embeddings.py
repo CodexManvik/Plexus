@@ -1,11 +1,9 @@
 """
-embeddings.py — sentence-transformers wrapper + Oracle 23ai vector search helpers.
+embeddings.py — embedding backends + Oracle 23ai vector search helpers.
 
-Model: all-MiniLM-L6-v2  (384-dim, fast, good quality for contract clauses)
-
-Oracle 23ai stores vectors as VECTOR(384, FLOAT32).  Because SQLAlchemy doesn't
-have a first-class Oracle VECTOR type yet, raw SQL is used for the nearest-
-neighbour query via VECTOR_DISTANCE(..., COSINE).
+Supports either sentence-transformers models or a local GGUF embedding model
+through llama-cpp-python. The Oracle VECTOR dimension is configured separately
+through the project settings so the database column matches the model output.
 """
 from __future__ import annotations
 
@@ -21,21 +19,78 @@ from app.config import settings
 # ── Model loading (lazy singleton) ────────────────────────────────────────────
 
 _model = None
+_model_backend = ""
+_model_load_attempted = False
 
 
 def _get_model():
-    global _model
-    if _model is None:
+    global _model, _model_backend, _model_load_attempted
+    if _model is not None or _model_load_attempted:
+        return _model
+
+    _model_load_attempted = True
+
+    raw_model_ref = (settings.sentence_transformer_model or "").strip()
+    if not raw_model_ref:
+        print(
+            "[Embeddings] No SENTENCE_TRANSFORMER_MODEL configured. "
+            "Upload will continue without vector embeddings.",
+            file=sys.stderr,
+        )
+        return None
+
+    model_path = settings.resolve_embedding_model_path()
+    if model_path and model_path.is_file() and model_path.suffix.lower() == ".gguf":
         try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
-            _model = SentenceTransformer(settings.sentence_transformer_model)
+            from llama_cpp import Llama  # type: ignore
+
+            _model = Llama(
+                model_path=str(model_path),
+                embedding=True,
+                n_ctx=2048,
+                verbose=False,
+            )
+            _model_backend = "llama_cpp"
+            print(f"[Embeddings] Loaded GGUF embedding model from {model_path}.", file=sys.stderr)
+            return _model
         except ImportError:
             print(
-                "[Embeddings] sentence-transformers not installed. "
-                "Run: pip install sentence-transformers",
+                "[Embeddings] llama-cpp-python is not installed. Run: uv pip install llama-cpp-python",
                 file=sys.stderr,
             )
             _model = None
+            return None
+        except Exception as exc:
+            print(
+                f"[Embeddings] Failed to load GGUF embedding model '{model_path}': {exc}. "
+                "Upload will continue without vector embeddings.",
+                file=sys.stderr,
+            )
+            _model = None
+            return None
+
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+
+        if model_path and model_path.exists() and model_path.is_dir():
+            _model = SentenceTransformer(str(model_path))
+        else:
+            _model = SentenceTransformer(raw_model_ref)
+        _model_backend = "sentence_transformers"
+    except ImportError:
+        print(
+            "[Embeddings] sentence-transformers not installed. "
+            "Run: pip install sentence-transformers",
+            file=sys.stderr,
+        )
+        _model = None
+    except Exception as exc:
+        print(
+            f"[Embeddings] Failed to load embedding model '{raw_model_ref}': {exc}. "
+            "Upload will continue without vector embeddings.",
+            file=sys.stderr,
+        )
+        _model = None
     return _model
 
 
@@ -48,6 +103,22 @@ def embed(text_input: str) -> Optional[List[float]]:
     if model is None or not text_input or not text_input.strip():
         return None
     try:
+        if _model_backend == "llama_cpp":
+            if hasattr(model, "embed"):
+                vector = model.embed(text_input, normalize=True)
+            elif hasattr(model, "create_embedding"):
+                result = model.create_embedding(text_input)
+                data = result.get("data", []) if isinstance(result, dict) else []
+                vector = data[0].get("embedding") if data else None
+            else:
+                vector = None
+
+            if vector is None:
+                return None
+            if hasattr(vector, "tolist"):
+                return vector.tolist()
+            return list(vector)
+
         vector = model.encode(text_input, normalize_embeddings=True)
         return vector.tolist()
     except Exception as exc:

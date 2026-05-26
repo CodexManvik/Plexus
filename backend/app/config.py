@@ -34,6 +34,8 @@ class Settings(BaseSettings):
         default=None, validation_alias="ORACLE_CLIENT_LIB_DIR"
     )
 
+    embedding_vector_dim: int = Field(default=384, validation_alias="EMBEDDING_VECTOR_DIM")
+
     # LLM provider selection and credentials
     llm_provider: str = Field(default="auto", validation_alias="LLM_PROVIDER")
     azure_openai_api_key: str | None = Field(default=None, validation_alias="AZURE_OPENAI_API_KEY")
@@ -75,6 +77,46 @@ class Settings(BaseSettings):
             normalized = value.strip().lower()
             return normalized or "auto"
         return "auto"
+
+    def resolve_embedding_model_path(self) -> Path | None:
+        raw_model_ref = (self.sentence_transformer_model or "").strip()
+        if not raw_model_ref:
+            return None
+
+        raw_path = Path(raw_model_ref).expanduser()
+        candidates = [raw_path]
+        if raw_path.suffix.lower() != ".gguf":
+            candidates.append(raw_path.with_suffix(".gguf"))
+
+        if not raw_path.is_absolute():
+            for root in (self.backend_root, self.backend_root.parent):
+                rooted = (root / raw_path).expanduser()
+                candidates.append(rooted)
+                if raw_path.suffix.lower() != ".gguf":
+                    candidates.append(rooted.with_suffix(".gguf"))
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            candidate_key = str(candidate)
+            if candidate_key in seen:
+                continue
+            seen.add(candidate_key)
+            try:
+                if candidate.exists():
+                    return candidate
+            except OSError:
+                continue
+
+        return None
+
+    def resolved_embedding_backend(self) -> str:
+        model_path = self.resolve_embedding_model_path()
+        raw_model_ref = (self.sentence_transformer_model or "").strip().lower()
+        if model_path and model_path.suffix.lower() == ".gguf":
+            return "llama_cpp"
+        if raw_model_ref.endswith(".gguf"):
+            return "llama_cpp"
+        return "sentence_transformers"
 
     def resolved_database_url(self) -> str:
         return (

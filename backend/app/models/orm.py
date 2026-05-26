@@ -23,6 +23,7 @@ from sqlalchemy.types import TypeDecorator, UserDefinedType
 # Native vector type abstraction provided by newer oracledb dialects
 from sqlalchemy.dialects.oracle import VECTOR
 
+from app.config import settings
 from app.database import Base
 
 
@@ -107,7 +108,7 @@ class ContractMaster(Base):
     document_text = Column(Text, nullable=True)
 
     # Updated: Native VECTOR definition for direct 26ai serialization tracking
-    document_vector = Column(VECTOR(384), nullable=True)
+    document_vector = Column(VECTOR(settings.embedding_vector_dim), nullable=True)
 
     workflow_state = Column(
         String(30), default="STAGED_DRAFT", server_default="STAGED_DRAFT", nullable=False
@@ -157,7 +158,7 @@ class ContractParameterExtracted(Base):
     spatial_json = Column(OracleNativeJSON(), nullable=True)
 
     # Updated: Native VECTOR definition for direct 26ai serialization tracking
-    vector_embed = Column(VECTOR(384), nullable=True)
+    vector_embed = Column(VECTOR(settings.embedding_vector_dim), nullable=True)
 
     source_query = Column(String(250), nullable=True)
     is_user_added = Column(Boolean, default=False, nullable=False)
