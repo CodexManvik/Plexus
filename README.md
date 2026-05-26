@@ -1,45 +1,57 @@
-# Plexus Local ICMS
+# ContractLens Enterprise Contract Manager
 
-This workspace provides a local-only stack for the Intelligent Contract Management System with pgvector, FastAPI, and llama.cpp.
+Full-stack contract lifecycle management platform with:
+- FastAPI backend (`backend/app`)
+- React + Vite frontend (`frontend/src`)
+- Rule-based extraction, citation tracking, verification, approvals, and dashboard analytics
 
-## Quick start
+## Backend Setup
+1. Create `backend/.env` (optional):
+```bash
+APP_ENV=development
+API_PREFIX=/api
+CORS_ORIGINS=http://localhost:5173
 
-1) Start pgvector
+# Preferred DB (Oracle or any SQLAlchemy async URL)
+# DATABASE_URL=oracle+oracledb_async://user:pass@/?dsn=host:1521/SERVICE
 
-```
-docker compose up -d
-```
-
-2) Copy env file and adjust as needed
-
-```
-copy .env.example .env
-```
-
-3) Install backend dependencies
-
-```
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r backend\requirements.txt
+# If DATABASE_URL is not set, backend auto-falls back to SQLite:
+# SQLITE_FALLBACK_URL=sqlite+aiosqlite:///./app/fallback_development.db
 ```
 
-4) Start llama.cpp server (edit model path if needed)
-
-```
-.\scripts\start-llama-server.ps1
-```
-
-5) Run the API
-
-```
-.\scripts\run-backend.ps1
+2. Install backend dependencies:
+```bash
+cd backend
+python -m pip install -r requirements.txt
 ```
 
-## API
+3. Start backend:
+```bash
+python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
 
-- `GET /health`
-- `POST /contracts`
-- `POST /contracts/{contract_id}/extract`
-- `PATCH /parameters/{parameter_id}`
-- `POST /search`
+## Frontend Setup
+1. Create `frontend/.env`:
+```bash
+VITE_API_BASE_URL=http://localhost:8000/api
+```
+
+2. Install frontend dependencies:
+```bash
+cd frontend
+npm install
+```
+
+3. Run frontend:
+```bash
+npm run dev
+```
+
+## Manual End-to-End Flow
+1. Login from `/login`.
+2. Upload a contract with metadata on `/upload`.
+3. Review extracted parameters + dynamic search add on `/extraction`.
+4. Verify original vs changed values on `/verification`.
+5. Approve/send back on `/approvals`.
+6. Review analytics on `/dashboard`.
+7. Maintain rules and diagnostics on `/master-maintenance`.

@@ -1,0 +1,31 @@
+[
+  { "category": "contract_type", "value": "MSA", "is_active": true },
+  { "category": "contract_type", "value": "NDA", "is_active": true },
+  { "category": "contract_type", "value": "SLA", "is_active": true },
+  { "category": "contract_type", "value": "SOW", "is_active": true },
+  { "category": "contract_type", "value": "Lease", "is_active": true },
+  { "category": "contract_type", "value": "Sale Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Purchase Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Distribution Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Franchise Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Joint Venture Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Shareholders Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Employment Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Consultancy Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Non-Compete Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Freelance Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Apprenticeship Contract", "is_active": true },
+  { "category": "contract_type", "value": "Loan Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Credit Facility Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Security Agreement", "is_active": true },
+  { "category": "contract_type", "value": "Lease Financing Agreement", "is_active": true },
+
+  { "category": "agreement_type", "value": "A1", "is_active": true },
+  { "category": "agreement_type", "value": "A2", "is_active": true },
+  { "category": "agreement_type", "value": "Commercial", "is_active": true },
+  { "category": "agreement_type", "value": "Vendor", "is_active": true },
+  { "category": "agreement_type", "value": "Internal", "is_active": true },
+
+  { "category": "execution_type", "value": "Wet Sign", "is_active": true },
+  { "category": "execution_type", "value": "E-Sign", "is_active": true }
+]

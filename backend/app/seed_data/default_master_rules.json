@@ -1,0 +1,38 @@
+[
+  {
+    "contract_type": "MSA",
+    "agreement_type": "Commercial",
+    "parameter_head": "Commercial Terms",
+    "parameter_name": "Scope of Services",
+    "parameter_logic": "P1 + P2 + P3",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "MSA",
+    "agreement_type": "Commercial",
+    "parameter_head": "Risk",
+    "parameter_name": "Limitation of Liability",
+    "parameter_logic": "P4 + P5",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "NDA",
+    "agreement_type": "Commercial",
+    "parameter_head": "Confidentiality",
+    "parameter_name": "Confidentiality Duration",
+    "parameter_logic": "P1 + P10",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "SOW",
+    "agreement_type": "Internal",
+    "parameter_head": "Dates",
+    "parameter_name": "Effective Date",
+    "parameter_logic": "P1",
+    "is_active": true,
+    "created_by": "system-seed"
+  }
+]

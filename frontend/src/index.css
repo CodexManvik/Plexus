@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-background text-on-background font-sans min-h-screen;
+    font-family: 'Inter', sans-serif;
+  }
+}
+
+.material-symbols-outlined {
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+  vertical-align: middle;
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #e0e3e5;
+  border-radius: 10px;
+}
+
+.pdf-page-shadow {
+  box-shadow: 0px 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.citation-highlight {
+  background-color: rgba(210, 228, 251, 0.4);
+  border-left: 3px solid #1a2b3c;
+  transition: all 0.2s ease;
+}
+
+.active-citation {
+  background-color: rgba(210, 228, 251, 0.8);
+  box-shadow: 0 0 0 2px #1a2b3c;
+}
