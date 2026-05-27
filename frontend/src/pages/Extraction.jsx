@@ -23,7 +23,9 @@ const Extraction = () => {
   const [pdfDoc, setPdfDoc] = useState(null);
   const [pdfLoading, setPdfLoading] = useState(false);
   const [workflowStatus, setWorkflowStatus] = useState('');
+  const [currentPage, setCurrentPage] = useState(1);
   const canvasRef = useRef(null);
+  const containerRef = useRef(null);
   const renderTaskRef = useRef(null);
 
   // Synchronize internal status tracking when contract record completes mapping hydration
@@ -54,13 +56,20 @@ const Extraction = () => {
     }
   }, [contractId]);
 
-  // Render target pages when active citation selections shift focus parameters
+  // Synchronize page when selected parameter changes
+  useEffect(() => {
+    const targetPage = selectedParameter?.spatial_json?.page;
+    if (targetPage) {
+      setCurrentPage(Number(targetPage));
+    }
+  }, [selectedParamId, selectedParameter]);
+
+  // Render page when PDF document loads or current page shifts
   useEffect(() => {
     if (pdfDoc) {
-      const targetPage = selectedParameter?.spatial_json?.page || 1;
-      renderPdfPage(targetPage);
+      renderPdfPage(currentPage);
     }
-  }, [pdfDoc, selectedParamId, selectedParameter]);
+  }, [pdfDoc, currentPage]);
 
   const loadPdfDocument = async () => {
     if (!contractId || !window.pdfjsLib) return;
@@ -90,7 +99,8 @@ const Extraction = () => {
       const canvas = canvasRef.current;
       const context = canvas.getContext('2d');
       
-      const parentWidth = canvas.parentElement.clientWidth - 32;
+      let parentWidth = containerRef.current ? containerRef.current.clientWidth - 32 : 800;
+      if (parentWidth <= 0) parentWidth = 800; // Safe fallback
       const unscaledViewport = page.getViewport({ scale: 1.0 });
       const computedScale = parentWidth / unscaledViewport.width;
       const viewport = page.getViewport({ scale: computedScale });
@@ -139,6 +149,7 @@ const Extraction = () => {
     if (!selectedParameter?.spatial_json?.rects || !canvasRef.current) return null;
     const spatial = selectedParameter.spatial_json;
     if (spatial.char_fallback) return null; // Skip rendering text backups on raw layout overlays
+    if (Number(currentPage) !== Number(spatial.page)) return null;
 
     const [rect] = spatial.rects;
     const [x0, y0, x1, y1] = rect;
@@ -161,7 +172,7 @@ const Extraction = () => {
       borderRadius: '4px',
       transition: 'all 0.15s cubic-bezier(0.4, 0, 0.2, 1)',
     };
-  }, [selectedParameter, selectedParamId, pdfDoc]);
+  }, [selectedParameter, selectedParamId, pdfDoc, currentPage]);
 
   // Execute stage changes back to database constraints
   const executeWorkflowTransition = async (action) => {
@@ -233,29 +244,57 @@ const Extraction = () => {
 
       <div className="grid grid-cols-1 xl:grid-cols-[1fr_480px] gap-md items-start w-full">
         {/* Render Frame Window: Interactive PDF Viewer Panel */}
-        <div className="bg-white border border-slate-200 rounded-2xl p-md shadow-sm flex flex-col items-center justify-center min-h-[780px]">
+        <div className="bg-white border border-slate-200 rounded-2xl p-md shadow-sm flex flex-col w-full min-h-[780px]">
           <div className="w-full flex justify-between items-center border-b border-slate-100 pb-sm mb-md">
             <h2 className="font-bold text-sm text-slate-800">Visual PDF Target Preview Matrix</h2>
-            {selectedParameter?.spatial_json?.page && (
-              <span className="text-xs font-bold text-amber-700 bg-amber-50 px-sm py-[2px] rounded-md">
-                Displaying Target Page: {selectedParameter.spatial_json.page}
-              </span>
+            {pdfDoc && (
+              <div className="flex items-center gap-xs">
+                <button
+                  type="button"
+                  disabled={currentPage <= 1}
+                  onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                  className="p-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 disabled:opacity-40 disabled:hover:bg-white transition-colors"
+                  title="Previous Page"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 19l-7-7 7-7" />
+                  </svg>
+                </button>
+                <span className="text-xs font-mono font-bold text-slate-600 bg-slate-100 px-sm py-[2px] rounded-md">
+                  Page {currentPage} of {pdfDoc.numPages}
+                </span>
+                <button
+                  type="button"
+                  disabled={currentPage >= pdfDoc.numPages}
+                  onClick={() => setCurrentPage(prev => Math.min(pdfDoc.numPages, prev + 1))}
+                  className="p-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 disabled:opacity-40 disabled:hover:bg-white transition-colors"
+                  title="Next Page"
+                >
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5l7 7-7 7" />
+                  </svg>
+                </button>
+              </div>
             )}
           </div>
 
           {pdfLoading ? (
-            <div className="text-xs font-semibold text-slate-400 animate-pulse">Streaming object canvas views...</div>
+            <div className="flex-1 w-full flex items-center justify-center text-xs font-semibold text-slate-400 animate-pulse">
+              Streaming object canvas views...
+            </div>
           ) : (
-            <div className="relative border border-slate-200 bg-slate-100 rounded-xl overflow-hidden p-2 shadow-inner">
-              <canvas ref={canvasRef} className="block shadow-sm rounded-lg" />
-              {/* Proportional Render Box Container */}
-              {overlayStyle && <div style={overlayStyle} className="animate-pulse" />}
+            <div ref={containerRef} className="flex-1 w-full flex justify-center overflow-auto bg-slate-100 rounded-xl p-4 shadow-inner border border-slate-200 max-h-[750px] custom-scrollbar">
+              <div className="relative h-fit">
+                <canvas ref={canvasRef} className="block shadow-sm rounded-lg pdf-page-shadow" />
+                {/* Proportional Render Box Container */}
+                {overlayStyle && <div style={overlayStyle} className="animate-pulse" />}
+              </div>
             </div>
           )}
 
           {selectedParameter?.citation_text && (
             <div className="w-full mt-md p-md border border-slate-100 bg-slate-50 rounded-xl">
-              <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">Azure Ground Truth Citation Source</span>
+              <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">Ground Truth Citation Source</span>
               <p className="text-xs text-slate-700 mt-1 leading-relaxed italic">"{selectedParameter.citation_text}"</p>
             </div>
           )}

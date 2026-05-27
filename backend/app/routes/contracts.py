@@ -191,7 +191,20 @@ async def _load_active_rules(
             and_(MasterExtractionRule.is_active == True, MasterExtractionRule.contract_type == contract_type)
         )
     )
-    return fallback.scalars().all()
+    rules = fallback.scalars().all()
+    if rules:
+        return rules
+
+    # Category fallback: if no specific rules match the contract type, load general rules of the agreement type (category)
+    fallback_agreement = await db.execute(
+        select(MasterExtractionRule).where(
+            and_(
+                MasterExtractionRule.is_active == True,
+                MasterExtractionRule.agreement_type == agreement_type,
+            )
+        )
+    )
+    return fallback_agreement.scalars().all()
 
 
 def _build_rule_payload(rule: MasterExtractionRule) -> Dict[str, Any]:

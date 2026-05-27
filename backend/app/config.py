@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     sentence_transformer_model: str = Field(
         default="all-MiniLM-L6-v2", validation_alias="SENTENCE_TRANSFORMER_MODEL"
     )
+
+    # Add inside class Settings(BaseSettings) in backend/app/config.py:
+    
+    # Cohere Credentials
+    cohere_api_key: str | None = Field(default=None, validation_alias="COHERE_API_KEY")
+    cohere_model: str = Field(
+        default="command-r-plus", validation_alias="COHERE_MODEL"
+    )
     lock_lease_minutes: int = Field(default=15, validation_alias="LOCK_LEASE_MINUTES")
     dashboard_horizon_days: int = Field(default=30, validation_alias="DASHBOARD_HORIZON_DAYS")
     

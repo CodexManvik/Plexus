@@ -19,6 +19,10 @@ class MultiProviderLLMService:
         self.google_api_key = settings.google_ai_studio_api_key or ""
         self.google_model = settings.google_ai_studio_model
 
+        # Cohere Configurations
+        self.cohere_api_key = settings.cohere_api_key or ""
+        self.cohere_model = settings.cohere_model
+
         self._client: Optional[httpx.AsyncClient] = None
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -32,12 +36,26 @@ class MultiProviderLLMService:
             await self._client.aclose()
 
     def _provider_sequence(self) -> List[str]:
+        if self.provider == "cohere":
+            return ["cohere", "google", "azure"]
         if self.provider == "azure":
-            return ["azure", "google"]
+            return ["azure", "google", "cohere"]
         if self.provider == "google":
-            return ["google", "azure"]
-        return ["google", "azure"]
+            return ["google", "azure", "cohere"]
+        
+        # Auto mode: build sequence based on availability
+        seq = []
+        if self._cohere_available():
+            seq.append("cohere")
+        if self._google_available():
+            seq.append("google")
+        if self._azure_available():
+            seq.append("azure")
+        return seq or ["google"]
 
+    def _cohere_available(self) -> bool:
+        return bool(self.cohere_api_key and self.cohere_model)
+    
     def _azure_available(self) -> bool:
         return bool(
             self.azure_api_key
@@ -49,6 +67,84 @@ class MultiProviderLLMService:
     def _google_available(self) -> bool:
         return bool(self.google_api_key and self.google_model)
 
+
+    async def _cohere_chat_completion(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        response_format: Optional[Dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
+        """
+        Interacts with the Cohere Chat API (V2) using direct HTTPS protocol.
+        """
+        url = "https://api.cohere.com/v2/chat"
+        headers = {
+            "Authorization": f"Bearer {self.cohere_api_key}",
+            "Content-Type": "application/json",
+        }
+        
+        payload: Dict[str, Any] = {
+            "model": self.cohere_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": temperature,
+        }
+
+        if max_tokens > 0:
+            payload["max_tokens"] = max(max_tokens, 2000)
+
+        if response_format:
+            payload["response_format"] = response_format
+
+        client = self._get_client()
+        backoff = 1.0
+
+        for attempt in range(5):
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                message = data.get("message") or {}
+                content = message.get("content") or []
+                if content and isinstance(content, list):
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text_parts.append(block.get("text") or "")
+                    return "".join(text_parts).strip()
+                return ""
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code in (429, 500, 502, 503, 504) and attempt < 4:
+                    print(
+                        f"[Cohere API] Transient error {error.response.status_code}. Retrying in {backoff}s...",
+                        file=sys.stderr,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                print(
+                    f"[Cohere API] HTTP Error: {error.response.status_code} - {error.response.text}",
+                    file=sys.stderr,
+                )
+                break
+            except Exception as error:
+                if attempt < 4:
+                    print(
+                        f"[Cohere API] Connection error: {error}. Retrying in {backoff}s...",
+                        file=sys.stderr,
+                    )
+                    await asyncio.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                print(f"[Cohere API] Request Failed: {error}. Returning empty completion.", file=sys.stderr)
+                break
+
+        return ""
+    
     async def _azure_chat_completion(
         self,
         system_prompt: str,
@@ -199,9 +295,22 @@ class MultiProviderLLMService:
         - `LLM_PROVIDER=auto` prefers Google AI Studio when configured, then Azure.
         """
         for provider in self._provider_sequence():
+            if provider == "cohere":
+                if not self._cohere_available():
+                    print("[Cohere API] API key or model missing. Skipping.", file=sys.stderr)
+                    continue
+                answer = await self._cohere_chat_completion(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    response_format=response_format,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                if answer.strip():
+                    return answer
+
             if provider == "google":
                 if not self._google_available():
-                    print("[Google AI Studio] Credentials missing. Skipping provider.", file=sys.stderr)
                     continue
                 answer = await self._google_chat_completion(
                     system_prompt=system_prompt,
@@ -215,7 +324,6 @@ class MultiProviderLLMService:
 
             if provider == "azure":
                 if not self._azure_available():
-                    print("[Azure OpenAI] Credentials missing. Skipping provider.", file=sys.stderr)
                     continue
                 answer = await self._azure_chat_completion(
                     system_prompt=system_prompt,
