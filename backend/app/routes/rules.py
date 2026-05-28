@@ -38,6 +38,43 @@ async def list_active_rules(
     return result.scalars().all()
 
 
+@router.get("/pending", response_model=list[MasterRuleResponse])
+async def list_pending_rules(
+    contract_type: str | None = None,
+    agreement_type: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Returns AI-proposed rules staged for admin review (is_active=False, created_by='SYSTEM_AI_PROPOSAL')."""
+    query = select(MasterExtractionRule).where(
+        MasterExtractionRule.is_active == False,
+        MasterExtractionRule.created_by == "SYSTEM_AI_PROPOSAL",
+    )
+    if contract_type:
+        query = query.where(MasterExtractionRule.contract_type == contract_type)
+    if agreement_type:
+        query = query.where(MasterExtractionRule.agreement_type == agreement_type)
+    query = query.order_by(MasterExtractionRule.created_at.desc())
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
+@router.post("/{rule_id}/activate", response_model=MasterRuleResponse)
+async def activate_pending_rule(
+    rule_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Activates an AI-proposed rule, making it available for future extractions."""
+    row = await db.get(MasterExtractionRule, rule_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    if row.is_active:
+        raise HTTPException(status_code=400, detail="Rule is already active")
+    row.is_active = True
+    await db.commit()
+    await db.refresh(row)
+    return row
+
+
 @router.post("", response_model=MasterRuleResponse, status_code=status.HTTP_201_CREATED)
 async def define_parameter_logic_rule(
     payload: MasterRuleCreate,

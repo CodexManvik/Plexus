@@ -17,6 +17,7 @@ from app.database import AsyncSessionLocal, Base, engine, get_database_driver
 from app.routes import assistant, contracts, dashboard, maintenance, metadata, rules, verification
 from app.services.bootstrap import seed_defaults
 from app.services.llm import azure_llm
+from app.services.logger import clm_logger
 
 
 # ── Tables the ORM owns — all must exist for the schema to be considered valid ─
@@ -116,10 +117,9 @@ def _ensure_schema(sync_conn) -> None:
     # ── Check 1: missing tables ───────────────────────────────────────────────
     missing = _EXPECTED_TABLES - existing_tables
     if missing:
-        print(
+        clm_logger.warning(
             f"[Schema] Missing tables detected: {sorted(missing)}. "
-            "Dropping all and recreating from ORM metadata.",
-            file=sys.stderr,
+            "Dropping all and recreating from ORM metadata."
         )
         Base.metadata.drop_all(sync_conn)
         return  # create_all will run immediately after
@@ -138,10 +138,9 @@ def _ensure_schema(sync_conn) -> None:
                 continue
             actual_dim = getattr(col_info.get("type"), "dim", None)
             if actual_dim is not None and actual_dim != expected_dim:
-                print(
+                clm_logger.warning(
                     f"[Schema] VECTOR dim mismatch on {table_name}.{col_name}: "
-                    f"expected={expected_dim}, actual={actual_dim}. Rebuilding.",
-                    file=sys.stderr,
+                    f"expected={expected_dim}, actual={actual_dim}. Rebuilding."
                 )
                 Base.metadata.drop_all(sync_conn)
                 return
@@ -157,14 +156,13 @@ def _ensure_schema(sync_conn) -> None:
         for col_name in identity_cols:
             col_info = col_map.get(col_name)
             if col_info is not None and col_info.get("identity") is None:
-                print(
-                    f"[Schema] Identity missing on {table_name}.{col_name}. Rebuilding.",
-                    file=sys.stderr,
+                clm_logger.warning(
+                    f"[Schema] Identity missing on {table_name}.{col_name}. Rebuilding."
                 )
                 Base.metadata.drop_all(sync_conn)
                 return
 
-    print("[Schema] All tables present and schema valid — no rebuild required.", file=sys.stderr)
+    clm_logger.info("[Schema] All tables present and schema valid — no rebuild required.")
 
 
 # ── Oracle VECTOR index creation (async, idempotent via PL/SQL exception block)
@@ -194,14 +192,13 @@ async def _ensure_vector_indexes(conn) -> None:
         """
         try:
             await conn.execute(text(plsql))
-            print(f"[Schema] VECTOR index '{index_name}' ensured.", file=sys.stderr)
+            clm_logger.info(f"[Schema] VECTOR index '{index_name}' ensured.")
         except Exception as exc:
             # Non-fatal: VECTOR indexes improve performance but queries fall back
             # to full table scans without them. Log and continue.
-            print(
-                f"[Schema] WARNING: Could not create VECTOR index '{index_name}': {exc}. "
-                "Queries will use full scans. This is expected on non-23ai Oracle instances.",
-                file=sys.stderr,
+            clm_logger.warning(
+                f"[Schema] Could not create VECTOR index '{index_name}': {exc}. "
+                "Queries will use full scans. This is expected on non-23ai Oracle instances."
             )
 
 
@@ -220,14 +217,14 @@ async def lifespan(_: FastAPI):
     Shutdown:
       5. Close the LLM HTTP client pool.
     """
-    print("[Startup] Beginning schema bootstrap...", file=sys.stderr)
+    clm_logger.info("[Startup] Beginning schema bootstrap...")
 
     try:
         async with engine.begin() as conn:
             # Step 1 + 2: inspect, optionally drop, then create all ORM tables.
             await conn.run_sync(_ensure_schema)
             await conn.run_sync(Base.metadata.create_all)
-            print("[Startup] ORM tables created/verified.", file=sys.stderr)
+            clm_logger.info("[Startup] ORM tables created/verified.")
 
             # Step 3: VECTOR indexes (Oracle 23ai only, idempotent).
             await _ensure_vector_indexes(conn)
@@ -235,15 +232,15 @@ async def lifespan(_: FastAPI):
         # Step 4: Seed default rules and metadata (runs in its own session).
         async with AsyncSessionLocal() as session:
             await seed_defaults(session)
-            print("[Startup] Seed data applied.", file=sys.stderr)
+            clm_logger.info("[Startup] Seed data applied.")
 
-        print("[Startup] Schema bootstrap complete. Server ready.", file=sys.stderr)
+        clm_logger.info("[Startup] Schema bootstrap complete. Server ready.")
 
         yield
 
     finally:
         await azure_llm.aclose()
-        print("[Shutdown] LLM client closed.", file=sys.stderr)
+        clm_logger.info("[Shutdown] LLM client closed.")
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────

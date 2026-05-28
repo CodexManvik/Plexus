@@ -54,6 +54,7 @@ from typing import Any, Dict, List, Optional, Sequence, TypedDict
 from app.config import settings
 from app.services import embeddings as emb
 from app.services.llm import azure_llm
+from app.services.logger import clm_logger
 
 # CoordIndex is defined in document_parser; import lazily to avoid circular deps
 # at module load time. The type alias is reproduced here for annotation clarity.
@@ -133,26 +134,30 @@ def _safe_parse_json(raw: str) -> Any:
 # ── Spatial resolution helpers ────────────────────────────────────────────────
 
 def _find_citation_offsets(document_text: str, citation: str) -> tuple[int, int]:
-    """
-    Locates `citation` within `document_text` using exact then case-insensitive
-    substring match. Returns (start, end) or (0, 0) on failure.
-    """
     if not citation or not document_text:
         return 0, 0
+    # 1. Exact verbatim
     idx = document_text.find(citation)
     if idx != -1:
         return idx, idx + len(citation)
+    # 2. Case-insensitive
     idx = document_text.lower().find(citation.lower())
     if idx != -1:
         return idx, idx + len(citation)
-    # Trim from tail progressively to handle LLM-added ellipsis or truncation.
-    for length in range(len(citation) - 10, max(20, len(citation) // 2), -10):
-        fragment = citation[:length].strip()
-        if not fragment:
-            continue
-        idx = document_text.lower().find(fragment.lower())
+    # 3. Whitespace-normalized (handles LLM-introduced line breaks)
+    import re as _re
+    norm_cite = _re.sub(r'\s+', ' ', citation).strip()
+    norm_doc = _re.sub(r'\s+', ' ', document_text)
+    idx = norm_doc.lower().find(norm_cite.lower())
+    if idx != -1:
+        return idx, idx + len(norm_cite)
+    # 4. First sentence of citation only (avoids matching wrong paragraph via tail trim)
+    sentences = _re.split(r'(?<=[.!?])\s+', citation.strip())
+    first_sentence = sentences[0] if sentences else ""
+    if len(first_sentence) > 20:
+        idx = document_text.lower().find(first_sentence.lower())
         if idx != -1:
-            return idx, idx + len(fragment)
+            return idx, idx + len(first_sentence)
     return 0, 0
 
 
@@ -161,47 +166,34 @@ def _resolve_coord_from_index(
     char_end: int,
     coord_index: Optional[CoordIndex],
 ) -> Optional[Dict[str, Any]]:
-    """
-    Maps (char_start, char_end) to the pre-computed line bounding-box array
-    from the coord_index built by document_parser._extract_pdf_text_with_index.
-
-    The lookup finds the coord_index key whose range overlaps or contains the
-    citation offsets. Returns a spatial_json dict compatible with the frontend
-    PDF viewer, or None if no match is found.
-
-    The returned dict has the structure:
-    {
-      "page": int,
-      "rects": [[x0, y0, x1, y1], ...],   — per-line rects for precise highlighting
-      "page_width": float,
-      "page_height": float,
-    }
-    """
-    if not coord_index or char_start == 0 and char_end == 0:
+    if not coord_index or (char_start == 0 and char_end == 0):
         return None
 
-    best_key: Optional[tuple[int, int]] = None
-    best_overlap = 0
-
+    # Collect ALL chunks that overlap the citation range (not just the best one)
+    matched_keys = []
     for (k_start, k_end) in coord_index:
         overlap = min(char_end, k_end) - max(char_start, k_start)
-        if overlap > best_overlap:
-            best_overlap = overlap
-            best_key = (k_start, k_end)
+        if overlap > 0:
+            matched_keys.append((k_start, k_end))
 
-    if best_key is None:
+    if not matched_keys:
         return None
 
-    line_arrays = coord_index[best_key]
-    if not line_arrays:
+    # Sort by position so rects are ordered top-to-bottom
+    matched_keys.sort(key=lambda k: k[0])
+
+    all_line_arrays = []
+    for key in matched_keys:
+        all_line_arrays.extend(coord_index[key])
+
+    if not all_line_arrays:
         return None
 
-    # line_arrays: [[page_num, x0, y0, x1, y1, page_width, page_height], ...]
-    first = line_arrays[0]
+    first = all_line_arrays[0]
     page_num = int(first[0])
     page_width = first[5]
     page_height = first[6]
-    rects = [[arr[1], arr[2], arr[3], arr[4]] for arr in line_arrays]
+    rects = [[arr[1], arr[2], arr[3], arr[4]] for arr in all_line_arrays]
 
     return {
         "page": page_num,
@@ -220,11 +212,10 @@ def _safe_embed(text: str) -> Optional[List[float]]:
     if vec is None:
         return None
     if len(vec) != settings.embedding_vector_dim:
-        print(
-            f"[Extraction] WARNING: embedding returned {len(vec)}-dim vector "
+        clm_logger.warning(
+            f"[Extraction] embedding returned {len(vec)}-dim vector "
             f"but EMBEDDING_VECTOR_DIM={settings.embedding_vector_dim}. "
-            "Update .env to match. Storing None to prevent DB type errors.",
-            file=sys.stderr,
+            "Update .env to match. Storing None to prevent DB type errors."
         )
         return None
     return vec
@@ -267,8 +258,11 @@ async def _retrieve_node(
         return state
 
     rule = state["rule"]
+    param_name = (rule.get("parameter_name") or rule.get("parameter_head") or "UNKNOWN").strip()
     query = (rule.get("parameter_logic") or rule.get("parameter_name") or "").strip()
     contract_id = state.get("contract_id")
+
+    clm_logger.info(f"[Extraction] Retrieve Node running for parameter '{param_name}' on contract '{contract_id}' with query: '{query}'")
 
     chunk_hits: List[Dict] = []
     if db is not None and contract_id and query:
@@ -279,8 +273,9 @@ async def _retrieve_node(
                 contract_id=contract_id,
                 top_k=5,
             )
+            clm_logger.info(f"[Extraction] Retrieve Node found {len(chunk_hits)} chunk hits for parameter '{param_name}'")
         except Exception as exc:
-            print(f"[Extraction] vector_search_chunks failed: {exc}", file=sys.stderr)
+            clm_logger.error(f"[Extraction] vector_search_chunks failed for parameter '{param_name}': {exc}", exc_info=True)
 
     state["pre_fetched_chunks"] = chunk_hits
     return state
@@ -298,6 +293,13 @@ async def _extractor_node(state: ExtractionState) -> ExtractionState:
     hint = f" (extraction hint: {param_logic})" if param_logic else ""
 
     chunk_hits = state.get("pre_fetched_chunks") or []
+
+    clm_logger.info(
+        f"[Extraction] Extractor Node running for parameter '{param_name}' (head: '{param_head}'). "
+        f"Context size: {len(chunk_hits)} chunks. "
+        f"Attempt: {state.get('retry_count', 0) + 1}. "
+        f"Previous critic feedback: {state.get('critic_feedback') or 'None'}"
+    )
 
     if chunk_hits:
         # Assemble context from retrieved chunks — ordered by relevance (already ASC distance).
@@ -336,15 +338,12 @@ async def _extractor_node(state: ExtractionState) -> ExtractionState:
     )
 
     try:
-        raw = await azure_llm.get_chat_completion(
+        raw = await azure_llm.get_extraction_completion(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            response_format=None,
-            temperature=0.0,
-            max_tokens=800,
         )
     except Exception as exc:
-        print(f"[Extraction] LLM call failed: {exc}", file=sys.stderr)
+        clm_logger.error(f"[Extraction] LLM extraction call failed for parameter '{param_name}': {exc}", exc_info=True)
         raw = ""
 
     parsed = _safe_parse_json(raw)
@@ -354,6 +353,11 @@ async def _extractor_node(state: ExtractionState) -> ExtractionState:
     else:
         state["value"] = None
         state["citation"] = None
+
+    clm_logger.info(
+        f"[Extraction] Extractor Node output for '{param_name}': "
+        f"Value: '{state['value']}' | Citation: '{state['citation']}'"
+    )
 
     return state
 
@@ -396,13 +400,21 @@ def _critic_node(state: ExtractionState) -> ExtractionState:
     On FAIL: writes specific feedback and increments retry_count.
     On EXHAUSTED: sets circuit_broken=True.
     """
+    rule = state["rule"]
+    param_name = (rule.get("parameter_name") or rule.get("parameter_head") or "UNKNOWN").strip()
     max_retries = settings.extraction_max_critic_retries
     citation = state.get("citation")
     value = state.get("value")
 
+    clm_logger.info(
+        f"[Extraction] Critic Node validating '{param_name}' "
+        f"(Value: '{value}', Citation: '{citation}', Attempt: {state.get('retry_count', 0) + 1}/{max_retries})"
+    )
+
     # Null extraction is a valid terminal state (parameter not found).
     if not citation and not value:
         state["critic_feedback"] = None
+        clm_logger.info(f"[Extraction] Critic Node passed for '{param_name}': parameter not found (null extraction)")
         return state
 
     # Validate citation presence (exact or whitespace-normalized).
@@ -428,6 +440,7 @@ def _critic_node(state: ExtractionState) -> ExtractionState:
                 f"(exact and whitespace-normalized). "
                 f"Attempted citation: {citation!r}"
             )
+            clm_logger.error(f"[Extraction] Critic Node validation FAILED (citation not found, circuit breaker triggered) for '{param_name}'. Citation: {citation!r}")
         else:
             state["critic_feedback"] = (
                 f"VALIDATION FAILURE (attempt {retry_count}/{max_retries}): "
@@ -435,10 +448,46 @@ def _critic_node(state: ExtractionState) -> ExtractionState:
                 f"You returned: {citation!r}. "
                 "Copy the exact text from the provided excerpts — do not paraphrase or modify."
             )
+            clm_logger.warning(
+                f"[Extraction] Critic Node validation FAILED (citation not found) for '{param_name}'. "
+                f"Attempt {retry_count}/{max_retries}. Citation: {citation!r}"
+            )
         return state
+
+    # Value plausibility check for financial and date fields
+    if value and citation_verified:
+        param_logic = (state["rule"].get("parameter_logic") or "").lower()
+        param_name_lower = (state["rule"].get("parameter_name") or "").lower()
+        is_date_field = any(kw in param_logic or kw in param_name_lower
+                            for kw in ["date", "effective", "term", "expiry", "renewal", "duration", "period"])
+        is_financial_field = any(kw in param_logic or kw in param_name_lower
+                                 for kw in ["payment", "amount", "rate", "price", "fee", "cost",
+                                            "charge", "invoice", "consideration", "salary", "compensation"])
+        if is_financial_field and not re.search(r'[\d,]+\.?\d*', value):
+            retry_count = state.get("retry_count", 0) + 1
+            state["retry_count"] = retry_count
+            if retry_count > settings.extraction_max_critic_retries:
+                state["circuit_broken"] = True
+                state["critic_feedback"] = (
+                    f"CIRCUIT BREAKER: financial field '{state['rule'].get('parameter_name')}' "
+                    f"extracted value '{value}' contains no numeric amount after {settings.extraction_max_critic_retries} retries."
+                )
+                clm_logger.error(f"[Extraction] Critic Node validation FAILED (financial format mismatch, circuit breaker triggered) for '{param_name}'. Value: '{value}'")
+            else:
+                state["critic_feedback"] = (
+                    f"VALIDATION FAILURE (attempt {retry_count}/{settings.extraction_max_critic_retries}): "
+                    f"'{state['rule'].get('parameter_name')}' is a financial field but '{value}' contains no "
+                    f"numeric amount. Extract the specific currency amount, rate, or percentage from the document."
+                )
+                clm_logger.warning(
+                    f"[Extraction] Critic Node validation FAILED (financial format mismatch) for '{param_name}'. "
+                    f"Attempt {retry_count}/{settings.extraction_max_critic_retries}. Value: '{value}'"
+                )
+            return state
 
     # PASS
     state["critic_feedback"] = None
+    clm_logger.info(f"[Extraction] Critic Node validation PASSED for '{param_name}'")
     return state
 
 
@@ -447,6 +496,8 @@ def _resolve_spatial_node(state: ExtractionState) -> ExtractionState:
     Resolves citation character offsets and maps them to pre-computed bounding
     boxes from the coord_index. No PDF re-parsing. No pdfplumber. No fuzzy scan.
     """
+    rule = state["rule"]
+    param_name = (rule.get("parameter_name") or rule.get("parameter_head") or "UNKNOWN").strip()
     citation = state.get("citation")
     document_text = state["document_text"]
     coord_index = state.get("coord_index")
@@ -463,6 +514,13 @@ def _resolve_spatial_node(state: ExtractionState) -> ExtractionState:
     state["_resolved_start"] = start if start > 0 else None
     state["_resolved_end"] = end if end > 0 else None
     state["_resolved_spatial"] = spatial
+
+    clm_logger.info(
+        f"[Extraction] Resolve Spatial Node for '{param_name}': "
+        f"Offsets: ({state.get('_resolved_start')}, {state.get('_resolved_end')}) | "
+        f"Page: {spatial.get('page') if spatial else 'None'} | "
+        f"Rects count: {len(spatial.get('rects', [])) if spatial else 0}"
+    )
     return state
 
 
@@ -479,10 +537,9 @@ async def _circuit_break_node(
     rule = state["rule"]
     param_name = (rule.get("parameter_name") or rule.get("parameter_head") or "UNKNOWN").strip()
 
-    print(
+    clm_logger.error(
         f"[Extraction] CIRCUIT BREAKER FIRED for parameter '{param_name}' "
-        f"on contract '{contract_id}'. {state.get('critic_feedback', '')}",
-        file=sys.stderr,
+        f"on contract '{contract_id}'. {state.get('critic_feedback', '')}"
     )
 
     # Write audit trail entry if a DB session was provided.
@@ -497,9 +554,10 @@ async def _circuit_break_node(
                 new_value_clob=state.get("critic_feedback"),
                 modified_by="SYSTEM_EXTRACTION_ENGINE",
             ))
+            clm_logger.info(f"[Extraction] Staged audit trail entry for circuit break on '{param_name}' in contract '{contract_id}'")
             # Note: caller is responsible for db.commit() — we don't commit inside nodes.
         except Exception as exc:
-            print(f"[Extraction] Audit write in circuit_break_node failed: {exc}", file=sys.stderr)
+            clm_logger.error(f"[Extraction] Audit write in circuit_break_node failed for '{param_name}': {exc}", exc_info=True)
 
     # Signal caller to flag contract for MANUAL_REVIEW.
     state["_requires_manual_review"] = True
@@ -520,8 +578,6 @@ def _terminal_node(state: ExtractionState) -> ExtractionState:
     value = state.get("value")
     citation = state.get("citation")
 
-    embed_vec = _safe_embed(citation or value or "")
-
     state["result"] = {
         "header_name": param_head or "General",
         "param_name": param_name,
@@ -532,10 +588,16 @@ def _terminal_node(state: ExtractionState) -> ExtractionState:
         "citation_start": state.get("_resolved_start"),
         "citation_end": state.get("_resolved_end"),
         "spatial_json": state.get("_resolved_spatial"),
-        "vector_embed": embed_vec,
+        "vector_embed": None,
         "source_query": param_logic or param_name,
         "requires_manual_review": state.get("_requires_manual_review", False),
     }
+
+    # Safely serialize result dict without massive vector dumps
+    clm_logger.info(
+        f"[Extraction] Terminal Node completed for '{param_name}': "
+        f"Result Dict: {json.dumps({k: v for k, v in state['result'].items() if k != 'vector_embed'}, default=str)}"
+    )
     return state
 
 
@@ -551,25 +613,41 @@ async def _run_section_group(
 ) -> List[Dict[str, Any]]:
     """
     Processes a single section group (rules sharing the same parameter_head).
-    Performs ONE vector retrieval call for the section, then distributes the
-    retrieved chunks to all rules' extractor nodes — avoiding redundant DB hits.
+    Performs union retrieval queries (up to 3 distinct queries) to pre-fetch chunks.
     """
+    section_name = (rules[0].get("parameter_head") or "General").strip() if rules else "General"
     async with semaphore:
-        # ── Single shared retrieval for the whole section ─────────────────────
-        # Use the section header itself as the retrieval query to maximize
-        # recall across all parameters in this structural section.
-        section_query = (rules[0].get("parameter_head") or "").strip()
-        shared_chunks: List[Dict] = []
-        if db is not None and contract_id and section_query:
-            try:
-                shared_chunks = await emb.vector_search_chunks(
-                    db=db,
-                    query_text=section_query,
-                    contract_id=contract_id,
-                    top_k=8,  # Slightly wider recall for section-level queries
-                )
-            except Exception as exc:
-                print(f"[Extraction] Section retrieval failed: {exc}", file=sys.stderr)
+        # Build distinct queries from all rules in the section (cap at 3 to limit DB calls)
+        distinct_queries = list(dict.fromkeys(
+            (rule.get("parameter_logic") or rule.get("parameter_name") or "").strip()
+            for rule in rules
+            if (rule.get("parameter_logic") or rule.get("parameter_name") or "").strip()
+        ))[:3]
+
+        clm_logger.info(
+            f"[Extraction] Starting section group '{section_name}' processing with {len(rules)} rules. "
+            f"Distinct queries: {distinct_queries}"
+        )
+
+        all_chunks: dict[int, dict] = {}
+        if db is not None and contract_id and distinct_queries:
+            for query in distinct_queries:
+                try:
+                    hits = await emb.vector_search_chunks(
+                        db=db,
+                        query_text=query,
+                        contract_id=contract_id,
+                        top_k=6,
+                    )
+                    for hit in hits:
+                        chunk_id = hit.get("chunk_id")
+                        if chunk_id is not None and chunk_id not in all_chunks:
+                            all_chunks[chunk_id] = hit
+                except Exception as exc:
+                    clm_logger.error(f"[Extraction] Section retrieval failed for query '{query}': {exc}", exc_info=True)
+
+        shared_chunks = sorted(all_chunks.values(), key=lambda x: float(x.get("distance") or 1.0))
+        clm_logger.info(f"[Extraction] Section group '{section_name}' pre-fetched {len(shared_chunks)} chunks for contract '{contract_id}'")
 
         # ── Run each rule through the state machine ───────────────────────────
         results: List[Dict[str, Any]] = []
@@ -589,10 +667,6 @@ async def _run_section_group(
             }
 
             max_retries = settings.extraction_max_critic_retries
-
-            # ── Execute the graph inline (no LangGraph runner import needed for
-            # simple sequential node transitions; LangGraph StateGraph used for
-            # complex conditional routing) ────────────────────────────────────
 
             # Node: extractor (initial pass)
             state = await _extractor_node(state)
@@ -621,14 +695,57 @@ async def _run_section_group(
                 # FAIL — re-run extractor with feedback injected
                 state = await _extractor_node(state)
 
+            # Second pass: if extraction returned null, retry with a broader composite query
+            if not state.get("value") and not state.get("circuit_broken") and db is not None and contract_id:
+                param_head = (rule.get("parameter_head") or "").strip()
+                param_name = (rule.get("parameter_name") or "").strip()
+                param_logic = (rule.get("parameter_logic") or "").strip()
+                broader_query = " ".join(filter(None, [param_head, param_name, param_logic]))
+                clm_logger.info(f"[Extraction] First-pass returned null for '{param_name}'. Initiating second-pass broader query: '{broader_query}'")
+                try:
+                    extra_hits = await emb.vector_search_chunks(
+                        db=db,
+                        query_text=broader_query,
+                        contract_id=contract_id,
+                        top_k=12,
+                    )
+                    existing_ids = {c.get("chunk_id") for c in (state.get("pre_fetched_chunks") or [])}
+                    new_chunks = [h for h in extra_hits if h.get("chunk_id") not in existing_ids]
+                    if new_chunks:
+                        clm_logger.info(f"[Extraction] Second-pass found {len(new_chunks)} new chunks. Appending top 6 to context.")
+                        state["pre_fetched_chunks"] = (state.get("pre_fetched_chunks") or []) + new_chunks[:6]
+                        state["critic_feedback"] = None
+                        state["retry_count"] = 0
+                        # Re-run extraction with expanded context
+                        state = await _extractor_node(state)
+                        while True:
+                            state = _critic_node(state)
+                            if state.get("circuit_broken") or state.get("critic_feedback") is None:
+                                break
+                            if state.get("retry_count", 0) > settings.extraction_max_critic_retries:
+                                state["circuit_broken"] = True
+                                state = await _circuit_break_node(state, db=db, contract_id=contract_id)
+                                break
+                            state = await _extractor_node(state)
+                        if state.get("circuit_broken"):
+                            state = await _circuit_break_node(state, db=db, contract_id=contract_id)
+                    else:
+                        clm_logger.info(f"[Extraction] Second-pass broader query returned no new chunks.")
+                except Exception as exc:
+                    clm_logger.error(f"[Extraction] Second-pass retrieval failed for '{param_name}': {exc}", exc_info=True)
+
             # Node: resolve_spatial (only if not circuit-broken or has value)
             if state.get("value") or state.get("citation"):
                 state = _resolve_spatial_node(state)
 
             # Node: terminal
             state = _terminal_node(state)
+            if state.get("result") is not None:
+                embed_input = state.get("citation") or state.get("value") or ""
+                state["result"]["vector_embed"] = await asyncio.to_thread(_safe_embed, embed_input)
             results.append(state["result"])
 
+        clm_logger.info(f"[Extraction] Completed section group '{section_name}' processing.")
         return results
 
 
@@ -669,6 +786,9 @@ class ExtractionEngine:
         """
         if not rules:
             return []
+
+        clm_logger.info(f"=== STARTING EXTRACTION ENGINE ===")
+        clm_logger.info(f"Contract ID: {contract_id} | Rules Count: {len(rules)}")
 
         # ── Group rules by section header ─────────────────────────────────────
         section_groups: dict[str, list[Dict[str, Any]]] = defaultdict(list)
@@ -728,6 +848,8 @@ class ExtractionEngine:
                     "requires_manual_review": False,
                 })
 
+        clm_logger.info(f"=== COMPLETED EXTRACTION ENGINE ===")
+        clm_logger.info(f"Contract ID: {contract_id} | Successful Extractions: {len(ordered_results)}")
         return ordered_results
 
 

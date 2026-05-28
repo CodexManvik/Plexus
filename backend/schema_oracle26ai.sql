@@ -178,7 +178,7 @@ CREATE TABLE contract_document_chunks (
     -- Array of per-line bounding boxes: [[page,x0,y0,x1,y1,pw,ph],...]
     spatial_json JSON,
     -- Paragraph-level embedding for granular cosine search
-    chunk_vector VECTOR(384, FLOAT32),
+    chunk_vector VECTOR(1024, FLOAT32),
     CONSTRAINT uq_chunk_contract_idx UNIQUE (contract_id, chunk_index)
 );
 

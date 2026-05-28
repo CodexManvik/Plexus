@@ -197,7 +197,7 @@ async def ask_assistant(payload: AssistantQueryRequest, db: AsyncSession = Depen
         )
 
     system_prompt = (
-        "You are ContractLens AI, a contract retrieval assistant. "
+        "You are a contract retrieval assistant. "
         "Answer strictly from the provided contract excerpts. "
         "If the excerpts do not contain the answer, say the selected documents do not show it. "
         "Be concise and cite relevant contract IDs."

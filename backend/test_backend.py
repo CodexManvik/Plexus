@@ -16,7 +16,8 @@ async def run_integration_tests():
     print("=== STARTING CLM BACKEND INTEGRATION TESTS ===")
     print("[1/6] Running diagnostic health check...")
     
-    async with httpx.AsyncClient() as client:
+    timeout = httpx.Timeout(60.0, connect=30.0, read=60.0, write=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         try:
             res = await client.get(f"{API_URL}/health")
             print(f"Health check status: {res.status_code} - {res.json()}")
@@ -74,15 +75,15 @@ async def run_integration_tests():
 
         # 5. Submit for approvals
         print("\n[5/6] Submitting staged draft to approvals queue...")
-        sub_res = await client.post(f"{API_URL}/contracts/{contract_id}/submit-approval")
+        sub_res = await client.post(f"{API_URL}/contracts/{contract_id}/submit-approval", json={"modified_by": "Alex Miller"})
         assert sub_res.status_code == 200, f"Submission failed: {sub_res.text}"
-        print(f"Approval Queue status: {sub_res.json()['message']}")
+        print(f"Approval Queue status: {sub_res.json()['status']}")
 
         # 6. Final authorization manager execution
         print("\n[6/6] Executing operational approval by Manager...")
-        app_res = await client.post(f"{API_URL}/contracts/{contract_id}/approve")
+        app_res = await client.post(f"{API_URL}/contracts/{contract_id}/approve", json={"modified_by": "Alex Miller"})
         assert app_res.status_code == 200, f"Approval authorization failed: {app_res.text}"
-        print(f"Approval authorized! Response: {app_res.json()['message']}")
+        print(f"Approval authorized! Response workflow state: {app_res.json()['status']}")
 
         # Final state check
         final_res = await client.get(f"{API_URL}/contracts/{contract_id}")

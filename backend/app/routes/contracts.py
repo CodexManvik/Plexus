@@ -14,6 +14,7 @@ contracts.py — key changes from original:
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -21,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -50,11 +51,14 @@ from app.schemas.pydantic_models import (
     ParameterVerifyRequest,
     ReExtractionResponse,
     WorkflowActionRequest,
+    SemanticSearchResult,
+    SemanticSearchResponse,
 )
 from app.services.document_parser import CoordIndex, extract_document_text
 from app.services.extraction import extraction_engine
 from app.services import embeddings as emb
 from app.services.embeddings import embed_batch
+from app.services.logger import clm_logger
 
 router = APIRouter(prefix="/contracts", tags=["Contracts Workflow"])
 
@@ -120,7 +124,15 @@ async def _build_and_store_chunks(
 
     # ── Batch embed all chunks in a single model call ─────────────────────────
     chunk_texts = [r["chunk_text"] for r in chunk_records]
-    vectors: List[Optional[List[float]]] = embed_batch(chunk_texts)
+    vectors: List[Optional[List[float]]] = await asyncio.to_thread(embed_batch, chunk_texts)
+
+    # Load existing chunk indices to avoid hitting uq_chunk_contract_idx on re-runs
+    existing_result = await db.execute(
+        select(ContractDocumentChunk.chunk_index).where(
+            ContractDocumentChunk.contract_id == contract_id
+        )
+    )
+    existing_indices = {row[0] for row in existing_result.all()}
 
     # ── Persist chunk rows ────────────────────────────────────────────────────
     valid_vectors: List[List[float]] = []
@@ -132,15 +144,16 @@ async def _build_and_store_chunks(
         else:
             store_vec = None
 
-        db.add(ContractDocumentChunk(
-            contract_id=contract_id,
-            chunk_index=record["chunk_index"],
-            chunk_text=record["chunk_text"],
-            char_start=record["char_start"],
-            char_end=record["char_end"],
-            spatial_json=record["spatial_json"],
-            chunk_vector=store_vec,
-        ))
+        if record["chunk_index"] not in existing_indices:
+            db.add(ContractDocumentChunk(
+                contract_id=contract_id,
+                chunk_index=record["chunk_index"],
+                chunk_text=record["chunk_text"],
+                char_start=record["char_start"],
+                char_end=record["char_end"],
+                spatial_json=record["spatial_json"],
+                chunk_vector=store_vec,
+            ))
 
     if not valid_vectors:
         return None
@@ -180,6 +193,11 @@ async def _classify_and_inject_rules(
     from app.services.llm import azure_llm
     import json as _json
 
+    clm_logger.info(
+        f"[Classification] Starting auto-classification for contract '{contract_id}' "
+        f"(submitted_contract_type: '{submitted_contract_type}', submitted_agreement_type: '{submitted_agreement_type}')"
+    )
+
     doc_head = document_text[:6000]
 
     system_prompt = (
@@ -212,8 +230,11 @@ async def _classify_and_inject_rules(
             max_tokens=2000,
         )
     except Exception as exc:
-        import sys
-        print(f"[Classification] LLM call failed: {exc}", file=sys.stderr)
+        clm_logger.error(f"[Classification] LLM call failed for contract '{contract_id}': {exc}", exc_info=True)
+        return resolved_ct, resolved_at, transient_rules
+
+    if not raw.strip():
+        clm_logger.warning(f"[Classification] LLM returned empty response — skipping auto-classification for contract '{contract_id}'")
         return resolved_ct, resolved_at, transient_rules
 
     # Import the JSON parser from extraction to avoid code duplication.
@@ -221,17 +242,20 @@ async def _classify_and_inject_rules(
     parsed = _safe_parse_json(raw)
 
     if not isinstance(parsed, dict):
-        import sys
-        print(
-            f"[Classification] Expected JSON object, got {type(parsed).__name__}. "
-            f"Raw (first 300 chars): {(raw or '')[:300]}",
-            file=sys.stderr,
+        clm_logger.warning(
+            f"[Classification] LLM response is not a valid JSON dictionary: {type(parsed).__name__} for contract '{contract_id}'. "
+            f"Raw (first 300 chars): {raw[:300]}"
         )
         return resolved_ct, resolved_at, transient_rules
 
     resolved_ct = (parsed.get("contract_type") or submitted_contract_type).strip().upper()
     resolved_at = (parsed.get("agreement_type") or submitted_agreement_type).strip().upper()
     raw_rules = parsed.get("rules") or []
+
+    clm_logger.info(
+        f"[Classification] Contract '{contract_id}' successfully auto-classified to: "
+        f"contract_type='{resolved_ct}', agreement_type='{resolved_at}'. Generated {len(raw_rules)} staged rules."
+    )
 
     # ── Stage generated rules in master_extraction_rules ─────────────────────
     for rule_def in raw_rules:
@@ -368,7 +392,7 @@ async def _load_contract(db: AsyncSession, contract_id: str) -> Optional[Contrac
     return result.scalars().first()
 
 
-async def _write_audit(
+def _write_audit(
     db: AsyncSession,
     contract_id: str,
     action_type: str,
@@ -606,7 +630,7 @@ async def upload_contract(
         contract.contract_type = resolved_ct
         contract.agreement_type = resolved_at
         auto_classified = True
-        await _write_audit(
+        _write_audit(
             db, contract_id, "LLM_CLASSIFIED", "SYSTEM_AI",
             "contract_type/agreement_type",
             f"{contract_type}/{agreement_type}",
@@ -649,12 +673,12 @@ async def upload_contract(
     # ── Circuit-breaker workflow escalation ───────────────────────────────────
     if any_manual_review:
         contract.workflow_state = "MANUAL_REVIEW"
-        await _write_audit(
+        _write_audit(
             db, contract_id, "MANUAL_REVIEW_REQUIRED", "SYSTEM_EXTRACTION_ENGINE",
             "workflow_state", "STAGED_DRAFT", "MANUAL_REVIEW",
         )
     else:
-        await _write_audit(db, contract_id, "UPLOAD", user_id, "workflow_state", None, contract.workflow_state)
+        _write_audit(db, contract_id, "UPLOAD", user_id, "workflow_state", None, contract.workflow_state)
 
     await db.commit()
 
@@ -775,6 +799,33 @@ async def search_contracts(
     return ContractSearchResponse(data=[_serialize_contract(c, include_document_text=False) for c in contracts], total=len(contracts))
 
 
+@router.post("/semantic-search", response_model=SemanticSearchResponse)
+async def semantic_search_contracts(
+    q: str = Query(..., min_length=1, max_length=500, description="Natural language search query"),
+    top_k: int = Query(default=10, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Searches contracts by semantic similarity using Oracle 23ai VECTOR_DISTANCE.
+    Returns contracts ranked by relevance to the natural language query.
+    Falls back to an empty result (not an error) if embeddings are unavailable.
+    """
+    hits = await emb.vector_search_documents(db=db, query_text=q, top_k=top_k)
+    results = [
+        SemanticSearchResult(
+            contract_id=hit["contract_id"],
+            contract_type=hit.get("contract_type"),
+            agreement_type=hit.get("agreement_type"),
+            organization=hit.get("organization"),
+            uploaded_filename=hit.get("uploaded_filename"),
+            similarity_score=round(max(0.0, 1.0 - float(hit.get("distance") or 1.0)), 4),
+        )
+        for hit in hits
+    ]
+    return SemanticSearchResponse(data=results, total=len(results), query=q)
+
+
+
 @router.get("/{contract_id}", response_model=ContractResponse)
 async def get_contract_details(contract_id: str, db: AsyncSession = Depends(get_db)):
     contract = await _load_contract(db, contract_id)
@@ -800,7 +851,7 @@ async def acquire_lock(contract_id: str, payload: LockAcquireRequest, db: AsyncS
         raise HTTPException(status_code=409, detail=f"Locked by {contract.checked_out_by}")
     contract.checked_out_by = payload.user_id
     contract.checkout_expiry = now + timedelta(minutes=settings.lock_lease_minutes)
-    await _write_audit(db, contract_id, "LOCK_ACQUIRED", payload.user_id, "checked_out_by", None, payload.user_id)
+    _write_audit(db, contract_id, "LOCK_ACQUIRED", payload.user_id, "checked_out_by", None, payload.user_id)
     await db.commit()
     return LockResponse(contract_id=contract_id, checked_out_by=contract.checked_out_by, checkout_expiry=contract.checkout_expiry, lock_acquired=True)
 
@@ -815,7 +866,7 @@ async def release_lock(contract_id: str, payload: LockAcquireRequest, db: AsyncS
     old_owner = contract.checked_out_by
     contract.checked_out_by = None
     contract.checkout_expiry = None
-    await _write_audit(db, contract_id, "LOCK_RELEASED", payload.user_id, "checked_out_by", old_owner, None)
+    _write_audit(db, contract_id, "LOCK_RELEASED", payload.user_id, "checked_out_by", old_owner, None)
     await db.commit()
     return {"status": "unlocked"}
 
@@ -840,7 +891,7 @@ async def update_parameter_override(
     contract = await db.get(ContractMaster, contract_id)
     if contract:
         contract.document_version = (contract.document_version or 1) + 1
-    await _write_audit(db, contract_id, "HUMAN_EDIT", payload.modified_by, f"parameter:{param_id}", old, payload.user_override)
+    _write_audit(db, contract_id, "HUMAN_EDIT", payload.modified_by, f"parameter:{param_id}", old, payload.user_override)
     await db.commit()
     await db.refresh(param)
     return _serialize_parameter(param)
@@ -861,7 +912,7 @@ async def verify_parameter(
     param.is_verified = payload.is_verified
     param.verification_note = payload.note
     param.last_modified = datetime.utcnow()
-    await _write_audit(db, contract_id, "VERIFY_PARAMETER", payload.modified_by, f"parameter:{param_id}:verified", str(not payload.is_verified), str(payload.is_verified))
+    _write_audit(db, contract_id, "VERIFY_PARAMETER", payload.modified_by, f"parameter:{param_id}:verified", str(not payload.is_verified), str(payload.is_verified))
     await db.commit()
     await db.refresh(param)
     return _serialize_parameter(param)
@@ -904,7 +955,7 @@ async def add_parameter_from_search(
         is_user_added=True,
     )
     db.add(param)
-    await _write_audit(db, contract_id, "USER_SEARCH_ADD", payload.modified_by, f"search_add:{payload.parameter_name}", None, payload.query)
+    _write_audit(db, contract_id, "USER_SEARCH_ADD", payload.modified_by, f"search_add:{payload.parameter_name}", None, payload.query)
     await db.commit()
     await db.refresh(param)
     return _serialize_parameter(param)
@@ -921,7 +972,7 @@ async def _transition(db, contract_id, state, payload, action_type):
     if state == "APPROVED":
         contract.approved_by = payload.modified_by
     note = f"{state} | {payload.comment}" if payload.comment else state
-    await _write_audit(db, contract_id, action_type, payload.modified_by, "workflow_state", prev, note)
+    _write_audit(db, contract_id, action_type, payload.modified_by, "workflow_state", prev, note)
     await db.commit()
     return {"status": state}
 
@@ -990,7 +1041,7 @@ async def clone_contract_template(contract_id: str, payload: WorkflowActionReque
             spatial_json=p.spatial_json, vector_embed=p.vector_embed, source_query=p.source_query,
             is_user_added=p.is_user_added, is_verified=p.is_verified, verification_note=p.verification_note,
         ))
-    await _write_audit(db, clone_id, "CLONE_TEMPLATE", payload.modified_by, "template_source", contract_id, clone_id)
+    _write_audit(db, clone_id, "CLONE_TEMPLATE", payload.modified_by, "template_source", contract_id, clone_id)
     await db.commit()
     cloned = await _load_contract(db, clone_id)
     return _serialize_contract(cloned)
@@ -1117,7 +1168,7 @@ async def re_extract_contract(
             is_user_added=False,
         ))
 
-    await _write_audit(
+    _write_audit(
         db, contract_id, "RE_EXTRACT", payload.modified_by,
         "parameters", f"{len(stale_params)} stale rows deleted",
         f"{len(extracted_params)} rows written, {parameters_filled} filled",

@@ -34,35 +34,19 @@ class Settings(BaseSettings):
         default=None, validation_alias="ORACLE_CLIENT_LIB_DIR"
     )
 
-    embedding_vector_dim: int = Field(default=384, validation_alias="EMBEDDING_VECTOR_DIM")
-
-    # LLM provider selection and credentials
-    llm_provider: str = Field(default="auto", validation_alias="LLM_PROVIDER")
-    azure_openai_api_key: str | None = Field(default=None, validation_alias="AZURE_OPENAI_API_KEY")
-    azure_openai_endpoint: str | None = Field(default=None, validation_alias="AZURE_OPENAI_ENDPOINT")
-    azure_openai_deployment_name: str = Field(
-        default="gpt-4o", validation_alias="AZURE_OPENAI_DEPLOYMENT_NAME"
-    )
-    azure_openai_api_version: str = Field(
-        default="2024-02-15-preview", validation_alias="AZURE_OPENAI_API_VERSION"
-    )
-    google_ai_studio_api_key: str | None = Field(
-        default=None, validation_alias="GOOGLE_AI_STUDIO_API_KEY"
-    )
-    google_ai_studio_model: str = Field(
-        default="gemini-1.5-flash", validation_alias="GOOGLE_AI_STUDIO_MODEL"
-    )
+    embedding_vector_dim: int = Field(default=1024, validation_alias="EMBEDDING_VECTOR_DIM")
 
     sentence_transformer_model: str = Field(
         default="all-MiniLM-L6-v2", validation_alias="SENTENCE_TRANSFORMER_MODEL"
     )
 
-    # Add inside class Settings(BaseSettings) in backend/app/config.py:
-    
     # Cohere Credentials
     cohere_api_key: str | None = Field(default=None, validation_alias="COHERE_API_KEY")
     cohere_model: str = Field(
         default="command-r-plus", validation_alias="COHERE_MODEL"
+    )
+    cohere_extraction_model: str = Field(
+        default="command-r-plus", validation_alias="COHERE_EXTRACTION_MODEL"
     )
     lock_lease_minutes: int = Field(default=15, validation_alias="LOCK_LEASE_MINUTES")
     dashboard_horizon_days: int = Field(default=30, validation_alias="DASHBOARD_HORIZON_DAYS")
@@ -85,13 +69,6 @@ class Settings(BaseSettings):
             return parts or ["*"]
         return ["*"]
 
-    @field_validator("llm_provider", mode="before")
-    @classmethod
-    def normalize_llm_provider(cls, value):
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            return normalized or "auto"
-        return "auto"
 
     def resolve_embedding_model_path(self) -> Path | None:
         raw_model_ref = (self.sentence_transformer_model or "").strip()

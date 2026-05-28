@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from typing import List, Optional
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.services.logger import clm_logger
+
+_embed_lock = threading.RLock()
 
 # ── Model loading (lazy singleton) ────────────────────────────────────────────
 
@@ -32,10 +36,9 @@ def _get_model():
 
     raw_model_ref = (settings.sentence_transformer_model or "").strip()
     if not raw_model_ref:
-        print(
+        clm_logger.warning(
             "[Embeddings] No SENTENCE_TRANSFORMER_MODEL configured. "
-            "Upload will continue without vector embeddings.",
-            file=sys.stderr,
+            "Upload will continue without vector embeddings."
         )
         return None
 
@@ -51,20 +54,19 @@ def _get_model():
                 verbose=False,
             )
             _model_backend = "llama_cpp"
-            print(f"[Embeddings] Loaded GGUF embedding model from {model_path}.", file=sys.stderr)
+            clm_logger.info(f"[Embeddings] Loaded GGUF embedding model from {model_path}.")
             return _model
         except ImportError:
-            print(
-                "[Embeddings] llama-cpp-python is not installed. Run: uv pip install llama-cpp-python",
-                file=sys.stderr,
+            clm_logger.warning(
+                "[Embeddings] llama-cpp-python is not installed. Run: uv pip install llama-cpp-python"
             )
             _model = None
             return None
         except Exception as exc:
-            print(
+            clm_logger.error(
                 f"[Embeddings] Failed to load GGUF embedding model '{model_path}': {exc}. "
                 "Upload will continue without vector embeddings.",
-                file=sys.stderr,
+                exc_info=True
             )
             _model = None
             return None
@@ -78,17 +80,16 @@ def _get_model():
             _model = SentenceTransformer(raw_model_ref)
         _model_backend = "sentence_transformers"
     except ImportError:
-        print(
+        clm_logger.warning(
             "[Embeddings] sentence-transformers not installed. "
-            "Run: pip install sentence-transformers",
-            file=sys.stderr,
+            "Run: pip install sentence-transformers"
         )
         _model = None
     except Exception as exc:
-        print(
+        clm_logger.error(
             f"[Embeddings] Failed to load embedding model '{raw_model_ref}': {exc}. "
             "Upload will continue without vector embeddings.",
-            file=sys.stderr,
+            exc_info=True
         )
         _model = None
     return _model
@@ -99,31 +100,32 @@ def embed(text_input: str) -> Optional[List[float]]:
     Returns a float list of length settings.embedding_vector_dim for `text_input`,
     or None if the model is unavailable.
     """
-    model = _get_model()
-    if model is None or not text_input or not text_input.strip():
-        return None
-    try:
-        if _model_backend == "llama_cpp":
-            if hasattr(model, "embed"):
-                vector = model.embed(text_input, normalize=True)
-            elif hasattr(model, "create_embedding"):
-                result = model.create_embedding(text_input)
-                data = result.get("data", []) if isinstance(result, dict) else []
-                vector = data[0].get("embedding") if data else None
-            else:
-                vector = None
+    with _embed_lock:
+        model = _get_model()
+        if model is None or not text_input or not text_input.strip():
+            return None
+        try:
+            if _model_backend == "llama_cpp":
+                if hasattr(model, "embed"):
+                    vector = model.embed(text_input, normalize=True)
+                elif hasattr(model, "create_embedding"):
+                    result = model.create_embedding(text_input)
+                    data = result.get("data", []) if isinstance(result, dict) else []
+                    vector = data[0].get("embedding") if data else None
+                else:
+                    vector = None
 
-            if vector is None:
-                return None
-            if hasattr(vector, "tolist"):
-                return vector.tolist()
-            return list(vector)
+                if vector is None:
+                    return None
+                if hasattr(vector, "tolist"):
+                    return vector.tolist()
+                return list(vector)
 
-        vector = model.encode(text_input, normalize_embeddings=True)
-        return vector.tolist()
-    except Exception as exc:
-        print(f"[Embeddings] encode error: {exc}", file=sys.stderr)
-        return None
+            vector = model.encode(text_input, normalize_embeddings=True)
+            return vector.tolist()
+        except Exception as exc:
+            clm_logger.error(f"[Embeddings] encode error: {exc}", exc_info=True)
+            return None
 
 
 def embed_batch(texts: List[str]) -> List[Optional[List[float]]]:
@@ -132,37 +134,38 @@ def embed_batch(texts: List[str]) -> List[Optional[List[float]]]:
     Returns a list of the same length; entries are None if the text is empty
     or if the model is unavailable.
     """
-    model = _get_model()
-    if model is None:
-        return [None] * len(texts)
+    with _embed_lock:
+        model = _get_model()
+        if model is None:
+            return [None] * len(texts)
 
-    results: List[Optional[List[float]]] = []
+        results: List[Optional[List[float]]] = []
 
-    if _model_backend == "llama_cpp":
-        # llama_cpp does not expose a native batch encode; fall back to sequential.
-        for text in texts:
-            results.append(embed(text))
-        return results
+        if _model_backend == "llama_cpp":
+            # llama_cpp does not expose a native batch encode; fall back to sequential.
+            for text in texts:
+                results.append(embed(text))
+            return results
 
-    # sentence_transformers supports true batch encoding.
-    non_empty_indices = [i for i, t in enumerate(texts) if t and t.strip()]
-    non_empty_texts = [texts[i] for i in non_empty_indices]
+        # sentence_transformers supports true batch encoding.
+        non_empty_indices = [i for i, t in enumerate(texts) if t and t.strip()]
+        non_empty_texts = [texts[i] for i in non_empty_indices]
 
-    if not non_empty_texts:
-        return [None] * len(texts)
+        if not non_empty_texts:
+            return [None] * len(texts)
 
-    try:
-        vectors = model.encode(non_empty_texts, normalize_embeddings=True, show_progress_bar=False)
-    except Exception as exc:
-        print(f"[Embeddings] batch encode error: {exc}", file=sys.stderr)
-        return [None] * len(texts)
+        try:
+            vectors = model.encode(non_empty_texts, normalize_embeddings=True, show_progress_bar=False)
+        except Exception as exc:
+            clm_logger.error(f"[Embeddings] batch encode error: {exc}", exc_info=True)
+            return [None] * len(texts)
 
-    # Re-assemble into original index positions.
-    output: List[Optional[List[float]]] = [None] * len(texts)
-    for result_idx, original_idx in enumerate(non_empty_indices):
-        vec = vectors[result_idx]
-        output[original_idx] = vec.tolist() if hasattr(vec, "tolist") else list(vec)
-    return output
+        # Re-assemble into original index positions.
+        output: List[Optional[List[float]]] = [None] * len(texts)
+        for result_idx, original_idx in enumerate(non_empty_indices):
+            vec = vectors[result_idx]
+            output[original_idx] = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+        return output
 
 
 def serialize(vector: Optional[List[float]]) -> Optional[str]:
@@ -213,7 +216,7 @@ async def vector_search_parameters(
             p.source_query,
             p.is_user_added,
             p.is_verified,
-            VECTOR_DISTANCE(p.vector_embed, TO_VECTOR(:query_vec), COSINE) AS distance
+            VECTOR_DISTANCE(p.vector_embed, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, FLOAT32), COSINE) AS distance
         FROM contract_parameters_extracted p
         WHERE p.vector_embed IS NOT NULL
         {contract_filter}
@@ -226,7 +229,7 @@ async def vector_search_parameters(
         rows = result.mappings().all()
         return [dict(row) for row in rows]
     except Exception as exc:
-        print(f"[VectorSearch] Oracle VECTOR_DISTANCE query failed: {exc}", file=sys.stderr)
+        clm_logger.error(f"[VectorSearch] Oracle VECTOR_DISTANCE query failed: {exc}", exc_info=True)
         return []
 
 
@@ -246,7 +249,7 @@ async def vector_search_chunks(
     if query_vec is None:
         return []
 
-    sql = text("""
+    sql = text(f"""
         SELECT
             c.chunk_id,
             c.contract_id,
@@ -255,7 +258,7 @@ async def vector_search_chunks(
             c.char_start,
             c.char_end,
             c.spatial_json,
-            VECTOR_DISTANCE(c.chunk_vector, TO_VECTOR(:query_vec), COSINE) AS distance
+            VECTOR_DISTANCE(c.chunk_vector, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, FLOAT32), COSINE) AS distance
         FROM contract_document_chunks c
         WHERE c.contract_id = :contract_id
           AND c.chunk_vector IS NOT NULL
@@ -272,23 +275,21 @@ async def vector_search_chunks(
         # ORA-00942: table or view does not exist — DDL not yet applied.
         if "942" in exc_str or "does not exist" in exc_str or "table" in exc_str:
             if not getattr(vector_search_chunks, "_ddl_warning_emitted", False):
-                print(
-                    "[VectorSearch] WARNING: 'contract_document_chunks' table not found in Oracle. "
+                clm_logger.warning(
+                    "[VectorSearch] 'contract_document_chunks' table not found in Oracle. "
                     "Run the new DDL from schema_oracle26ai.sql (CREATE TABLE contract_document_chunks ...). "
-                    "Falling back to document_text head+tail for extraction context.",
-                    file=sys.stderr,
+                    "Falling back to document_text head+tail for extraction context."
                 )
                 vector_search_chunks._ddl_warning_emitted = True  # type: ignore[attr-defined]
         elif "vector" in exc_str:
             if not getattr(vector_search_chunks, "_vector_warning_emitted", False):
-                print(
-                    "[VectorSearch] WARNING: Oracle VECTOR type not supported on this instance. "
-                    "Requires Oracle 23ai. Chunk vector search disabled.",
-                    file=sys.stderr,
+                clm_logger.warning(
+                    "[VectorSearch] Oracle VECTOR type not supported on this instance. "
+                    "Requires Oracle 23ai. Chunk vector search disabled."
                 )
                 vector_search_chunks._vector_warning_emitted = True  # type: ignore[attr-defined]
         else:
-            print(f"[VectorSearch] Chunk vector search failed: {exc}", file=sys.stderr)
+            clm_logger.error(f"[VectorSearch] Chunk vector search failed: {exc}", exc_info=True)
         return []
 
 
@@ -305,14 +306,14 @@ async def vector_search_documents(
     if query_vec is None:
         return []
 
-    sql = text("""
+    sql = text(f"""
         SELECT
             c.contract_id,
             c.contract_type,
             c.agreement_type,
             c.organization,
             c.uploaded_filename,
-            VECTOR_DISTANCE(c.document_vector, TO_VECTOR(:query_vec), COSINE) AS distance
+            VECTOR_DISTANCE(c.document_vector, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, FLOAT32), COSINE) AS distance
         FROM contracts_master c
         WHERE c.document_vector IS NOT NULL
         ORDER BY distance ASC
@@ -324,5 +325,5 @@ async def vector_search_documents(
         rows = result.mappings().all()
         return [dict(row) for row in rows]
     except Exception as exc:
-        print(f"[VectorSearch] Document vector search failed: {exc}", file=sys.stderr)
+        clm_logger.error(f"[VectorSearch] Document vector search failed: {exc}", exc_info=True)
         return []

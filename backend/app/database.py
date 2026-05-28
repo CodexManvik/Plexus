@@ -22,7 +22,7 @@ _configure_oracle_client()
 
 engine = create_async_engine(
     DATABASE_URL,
-    echo=settings.app_env == "development",
+    echo=False,
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,

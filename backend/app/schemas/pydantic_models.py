@@ -272,3 +272,19 @@ class MetadataBundleResponse(BaseModel):
     contract_types: List[str]
     agreement_types: List[str]
     execution_types: List[str]
+
+
+class SemanticSearchResult(BaseModel):
+    contract_id: str
+    contract_type: Optional[str] = None
+    agreement_type: Optional[str] = None
+    organization: Optional[str] = None
+    uploaded_filename: Optional[str] = None
+    similarity_score: float
+
+
+class SemanticSearchResponse(BaseModel):
+    data: List[SemanticSearchResult]
+    total: int
+    query: str
+

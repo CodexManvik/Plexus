@@ -10,6 +10,9 @@ from app.services.bootstrap import seed_defaults
 
 async def init_database():
     async with engine.begin() as conn:
+        print("Dropping existing tables to clear any stale schemas...")
+        await conn.run_sync(Base.metadata.drop_all)
+        print("Creating fresh database tables...")
         await conn.run_sync(Base.metadata.create_all)
 
     async with AsyncSessionLocal() as session:

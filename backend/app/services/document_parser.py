@@ -168,22 +168,44 @@ def _extract_page_lines(page: "fitz.Page", page_num: int) -> list[_ParsedLine]: 
     try:
         tabs = page.find_tables()
         for table in tabs.tables:
-            for row in table.extract():
-                for cell_text in row:
-                    if not cell_text or not str(cell_text).strip():
+            extracted = table.extract()
+            if hasattr(table, 'rows') and table.rows:
+                for row_idx, row in enumerate(table.rows):
+                    if not hasattr(row, 'cells') or not row.cells:
                         continue
-                    # Table cells don't carry per-cell bounding boxes through the
-                    # high-level API; use the table's overall bbox as an approximation.
-                    tb = table.bbox
-                    cell_str = str(cell_text).strip()
-                    parsed.append(_ParsedLine(
-                        text=cell_str,
-                        page_num=page_num,
-                        x0=tb[0], y0=tb[1], x1=tb[2], y1=tb[3],
-                        page_width=pw, page_height=ph,
-                        font_size=10.0,
-                        is_table_cell=True,
-                    ))
+                    for col_idx, cell in enumerate(row.cells):
+                        if cell is None:
+                            continue
+                        try:
+                            cell_text = extracted[row_idx][col_idx]
+                        except (IndexError, TypeError):
+                            continue
+                        if not cell_text or not str(cell_text).strip():
+                            continue
+                        parsed.append(_ParsedLine(
+                            text=str(cell_text).strip(),
+                            page_num=page_num,
+                            x0=cell[0], y0=cell[1],
+                            x1=cell[2], y1=cell[3],
+                            page_width=pw, page_height=ph,
+                            font_size=10.0,
+                            is_table_cell=True,
+                        ))
+            else:
+                # Fallback for older PyMuPDF: use whole-table bbox per cell
+                for row in extracted:
+                    for cell_text in row:
+                        if not cell_text or not str(cell_text).strip():
+                            continue
+                        tb = table.bbox
+                        parsed.append(_ParsedLine(
+                            text=str(cell_text).strip(),
+                            page_num=page_num,
+                            x0=tb[0], y0=tb[1], x1=tb[2], y1=tb[3],
+                            page_width=pw, page_height=ph,
+                            font_size=10.0,
+                            is_table_cell=True,
+                        ))
     except Exception as exc:
         print(f"[Parser] find_tables() failed on page {page_num}: {exc}", file=sys.stderr)
 
