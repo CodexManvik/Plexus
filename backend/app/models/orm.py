@@ -135,6 +135,12 @@ class ContractMaster(Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+    chunks = relationship(
+        "ContractDocumentChunk",
+        back_populates="contract",
+        cascade="all, delete-orphan",
+        lazy="noload",  # Never eager-load; queried directly by vector search.
+    )
 
 
 class ContractParameterExtracted(Base):
@@ -167,6 +173,37 @@ class ContractParameterExtracted(Base):
     last_modified = Column(DateTime, default=func.now(), onupdate=func.now())
 
     contract = relationship("ContractMaster", back_populates="parameters")
+
+
+class ContractDocumentChunk(Base):
+    """
+    Stores paragraph-level text chunks produced by the Layout-Aware Semantic
+    Accumulation parser.  Each chunk carries:
+      - its global character offsets into ContractMaster.document_text,
+      - a spatial_json array of per-line bounding boxes for frontend highlighting,
+      - a VECTOR embedding for Oracle 23ai cosine similarity search.
+    """
+    __tablename__ = "contract_document_chunks"
+    __table_args__ = (
+        UniqueConstraint("contract_id", "chunk_index", name="uq_chunk_contract_idx"),
+    )
+
+    chunk_id    = Column(Integer, Identity(start=1), primary_key=True)
+    contract_id = Column(
+        String(50), ForeignKey("contracts_master.contract_id", ondelete="CASCADE"), nullable=False
+    )
+    chunk_index  = Column(Integer, nullable=False)   # 0-based sequential position
+    chunk_text   = Column(Text, nullable=False)
+    char_start   = Column(Integer, nullable=False)   # global offset in document_text
+    char_end     = Column(Integer, nullable=False)
+
+    # List of per-line coordinate arrays: [[page, x0, y0, x1, y1, pw, ph], ...]
+    spatial_json = Column(OracleNativeJSON(), nullable=True)
+
+    # Paragraph-level vector for granular RAG retrieval.
+    chunk_vector = Column(VECTOR(settings.embedding_vector_dim), nullable=True)
+
+    contract = relationship("ContractMaster", back_populates="chunks")
 
 
 class ContractAuditTrail(Base):

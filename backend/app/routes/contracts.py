@@ -2,10 +2,15 @@
 contracts.py — key changes from original:
 
 1. file_bytes stored in document_blob (raw PDF/DOCX persisted for viewer).
-2. extraction_engine receives file_bytes + content_type for PDF coordinate extraction.
-3. document_vector computed and stored on upload.
-4. New endpoint GET /{contract_id}/document — serves the raw file.
-5. SQLite references removed.
+2. extract_document_text now returns (text, coord_index) — callers unpack the tuple.
+3. _build_and_store_chunks: layout-driven paragraph chunking with batch embed.
+4. document_vector computed as mean-pool across all chunk vectors (not first-5k-chars).
+5. ExtractionEngine receives coord_index, db, and contract_id for agentic RAG pipeline.
+6. _classify_and_inject_rules: LLM auto-classification for unknown contract types.
+   Generated rules staged in master_extraction_rules with is_active=False.
+7. Contracts with circuit-breaker exhaustion are flagged MANUAL_REVIEW in workflow_state.
+8. New endpoint GET /{contract_id}/document — serves the raw file.
+9. SQLite references removed.
 """
 from __future__ import annotations
 
@@ -13,6 +18,8 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from sqlalchemy import and_, func, or_, select
@@ -23,6 +30,7 @@ from app.config import settings
 from app.database import get_db
 from app.models.orm import (
     ContractAuditTrail,
+    ContractDocumentChunk,
     ContractMaster,
     ContractParameterExtracted,
     MasterExtractionRule,
@@ -43,14 +51,233 @@ from app.schemas.pydantic_models import (
     ReExtractionResponse,
     WorkflowActionRequest,
 )
-from app.services.document_parser import extract_document_text
+from app.services.document_parser import CoordIndex, extract_document_text
 from app.services.extraction import extraction_engine
 from app.services import embeddings as emb
+from app.services.embeddings import embed_batch
 
 router = APIRouter(prefix="/contracts", tags=["Contracts Workflow"])
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+async def _build_and_store_chunks(
+    db: AsyncSession,
+    contract_id: str,
+    document_text: str,
+    coord_index: CoordIndex,
+) -> Optional[List[float]]:
+    """
+    Splits the document into paragraph-level chunks using the coord_index boundaries
+    produced by the layout-aware parser. For each chunk:
+      - Writes a ContractDocumentChunk row with spatial_json (per-line coordinates).
+      - Computes the chunk embedding via embed_batch (single model.encode() call).
+
+    Returns the mean-pooled document_vector across all chunk vectors, or None if
+    embeddings are unavailable. This replaces the truncated 5,000-character document
+    embedding with a representation of the entire document.
+    """
+    if not document_text:
+        return None
+
+    # Build ordered list of (start, end, spatial_json) from coord_index.
+    # coord_index keys: (start_char, end_char) → [[page,x0,y0,x1,y1,pw,ph], ...]
+    sorted_keys = sorted(coord_index.keys(), key=lambda k: k[0])
+
+    chunk_records: List[Dict[str, Any]] = []
+    if sorted_keys:
+        for idx, (start, end) in enumerate(sorted_keys):
+            chunk_text = document_text[start:end]
+            if not chunk_text.strip():
+                continue
+            chunk_records.append({
+                "chunk_index": idx,
+                "chunk_text": chunk_text,
+                "char_start": start,
+                "char_end": end,
+                "spatial_json": coord_index[(start, end)],
+            })
+    else:
+        # Non-PDF path: coord_index is empty. Chunk the raw text at newline boundaries.
+        raw_chunks = [c.strip() for c in document_text.split("\n\n") if c.strip()]
+        cursor = 0
+        for idx, chunk_text in enumerate(raw_chunks):
+            start = document_text.find(chunk_text, cursor)
+            if start == -1:
+                start = cursor
+            end = start + len(chunk_text)
+            chunk_records.append({
+                "chunk_index": idx,
+                "chunk_text": chunk_text,
+                "char_start": start,
+                "char_end": end,
+                "spatial_json": None,
+            })
+            cursor = end
+
+    if not chunk_records:
+        return None
+
+    # ── Batch embed all chunks in a single model call ─────────────────────────
+    chunk_texts = [r["chunk_text"] for r in chunk_records]
+    vectors: List[Optional[List[float]]] = embed_batch(chunk_texts)
+
+    # ── Persist chunk rows ────────────────────────────────────────────────────
+    valid_vectors: List[List[float]] = []
+    for record, vec in zip(chunk_records, vectors):
+        # Dim guard: discard mismatched vectors to prevent Oracle type errors.
+        if vec is not None and len(vec) == settings.embedding_vector_dim:
+            valid_vectors.append(vec)
+            store_vec: Optional[List[float]] = vec
+        else:
+            store_vec = None
+
+        db.add(ContractDocumentChunk(
+            contract_id=contract_id,
+            chunk_index=record["chunk_index"],
+            chunk_text=record["chunk_text"],
+            char_start=record["char_start"],
+            char_end=record["char_end"],
+            spatial_json=record["spatial_json"],
+            chunk_vector=store_vec,
+        ))
+
+    if not valid_vectors:
+        return None
+
+    # ── Mean-pool document_vector across all chunk vectors ────────────────────
+    vector_matrix = np.array(valid_vectors, dtype=np.float32)
+    mean_vector: np.ndarray = vector_matrix.mean(axis=0)
+    # Re-normalize after averaging to restore unit-length for cosine search.
+    norm = np.linalg.norm(mean_vector)
+    if norm > 0:
+        mean_vector = mean_vector / norm
+    return mean_vector.tolist()
+
+
+async def _classify_and_inject_rules(
+    document_text: str,
+    submitted_contract_type: str,
+    submitted_agreement_type: str,
+    db: AsyncSession,
+    contract_id: str,
+) -> tuple[str, str, List[Dict[str, Any]]]:
+    """
+    Invoked when zero MasterExtractionRule rows match (contract_type, agreement_type).
+
+    Calls the LLM with the first 6,000 chars of the document to:
+      1. Confirm or correct the contract_type and agreement_type.
+      2. Generate a list of parameter extraction rules as a JSON payload.
+
+    Generated rules are written to master_extraction_rules with:
+      - is_active = False   (staged, not yet active)
+      - created_by = 'SYSTEM_AI_PROPOSAL'
+    This builds an administrator review queue. The rules are also returned
+    as transient payloads for immediate use in the current upload.
+
+    Returns: (resolved_contract_type, resolved_agreement_type, transient_rule_payloads)
+    """
+    from app.services.llm import azure_llm
+    import json as _json
+
+    doc_head = document_text[:6000]
+
+    system_prompt = (
+        "You are a contract classification and parameter schema generator. "
+        "Given a contract document excerpt, output a single valid JSON object with these keys: "
+        '"contract_type" (string, UPPER_SNAKE_CASE), '
+        '"agreement_type" (string, UPPER_SNAKE_CASE), '
+        '"rules" (array of objects, each with: "parameter_head" string, "parameter_name" string, '
+        '"parameter_logic" string describing where/how to extract the value). '
+        "Output ONLY valid JSON — no prose, no fences."
+    )
+    user_prompt = (
+        f"Submitted contract_type: {submitted_contract_type}\n"
+        f"Submitted agreement_type: {submitted_agreement_type}\n\n"
+        f"Document excerpt:\n{doc_head}\n\n"
+        "Classify this contract and generate 8–15 extraction rules covering all critical "
+        "legal and commercial parameters. Respond with the JSON object only."
+    )
+
+    resolved_ct = submitted_contract_type
+    resolved_at = submitted_agreement_type
+    transient_rules: List[Dict[str, Any]] = []
+
+    try:
+        raw = await azure_llm.get_chat_completion(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_format=None,
+            temperature=0.0,
+            max_tokens=2000,
+        )
+    except Exception as exc:
+        import sys
+        print(f"[Classification] LLM call failed: {exc}", file=sys.stderr)
+        return resolved_ct, resolved_at, transient_rules
+
+    # Import the JSON parser from extraction to avoid code duplication.
+    from app.services.extraction import _safe_parse_json
+    parsed = _safe_parse_json(raw)
+
+    if not isinstance(parsed, dict):
+        import sys
+        print(
+            f"[Classification] Expected JSON object, got {type(parsed).__name__}. "
+            f"Raw (first 300 chars): {(raw or '')[:300]}",
+            file=sys.stderr,
+        )
+        return resolved_ct, resolved_at, transient_rules
+
+    resolved_ct = (parsed.get("contract_type") or submitted_contract_type).strip().upper()
+    resolved_at = (parsed.get("agreement_type") or submitted_agreement_type).strip().upper()
+    raw_rules = parsed.get("rules") or []
+
+    # ── Stage generated rules in master_extraction_rules ─────────────────────
+    for rule_def in raw_rules:
+        if not isinstance(rule_def, dict):
+            continue
+        p_head = (rule_def.get("parameter_head") or "General").strip()
+        p_name = (rule_def.get("parameter_name") or "").strip()
+        p_logic = (rule_def.get("parameter_logic") or "").strip()
+        if not p_name:
+            continue
+
+        transient_rules.append({
+            "parameter_head": p_head,
+            "parameter_name": p_name,
+            "parameter_logic": p_logic,
+        })
+
+        # Check for existing rule with this signature before inserting.
+        existing = await db.execute(
+            select(MasterExtractionRule).where(
+                and_(
+                    MasterExtractionRule.contract_type == resolved_ct,
+                    MasterExtractionRule.agreement_type == resolved_at,
+                    MasterExtractionRule.parameter_head == p_head,
+                    MasterExtractionRule.parameter_name == p_name,
+                )
+            )
+        )
+        if existing.scalars().first() is not None:
+            continue  # Already staged or active — skip insertion.
+
+        db.add(MasterExtractionRule(
+            contract_type=resolved_ct,
+            agreement_type=resolved_at,
+            parameter_head=p_head,
+            parameter_name=p_name,
+            parameter_logic=p_logic[:250] if p_logic else None,
+            is_active=False,         # Staged — requires admin activation.
+            created_by="SYSTEM_AI_PROPOSAL",
+        ))
+
+    await db.flush()  # Assign PKs without committing the parent transaction.
+
+    return resolved_ct, resolved_at, transient_rules
+
+
 
 def _parse_date(value: Optional[str]) -> Optional[date]:
     if not value:
@@ -289,18 +516,19 @@ async def upload_contract(
     file_bytes = await file.read()
     content_type = file.content_type or ""
 
-    # Extract plain text for LLM context
-    document_text = extract_document_text(file.filename or "uploaded_document", content_type, file_bytes)
+    # ── Phase 1: Layout-aware parsing → (text, coord_index) ──────────────────
+    document_text, coord_index = extract_document_text(
+        file.filename or "uploaded_document", content_type, file_bytes
+    )
     if not document_text:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Could not extract readable text from the uploaded document.",
         )
 
-    # Compute document-level vector embedding
-    doc_vector = emb.embed(document_text[:5000])  # embed first 5k chars for speed
-
     contract_id = f"CON-{uuid.uuid4().hex[:10].upper()}"
+
+    # ── Phase 2: Persist contract master row (doc_vector set after chunking) ──
     contract = ContractMaster(
         contract_id=contract_id,
         organization=organization,
@@ -328,9 +556,9 @@ async def upload_contract(
         effective_date=_parse_date(effective_date),
         uploaded_filename=file.filename,
         uploaded_content_type=content_type,
-        document_blob=file_bytes,          # ← raw file stored here
+        document_blob=file_bytes,
         document_text=document_text,
-        document_vector=doc_vector,        # ← 384-dim embedding
+        document_vector=None,       # Populated below after mean-pool computation.
         workflow_state="STAGED_DRAFT",
         created_by=user_id,
     )
@@ -349,18 +577,59 @@ async def upload_contract(
     ]:
         await _upsert_metadata_option(db, cat, val)
 
+    await db.flush()  # Assign PK before chunk FK references.
+
+    # ── Phase 2: Build paragraph chunks + mean-pool document_vector ──────────
+    mean_pool_vector = await _build_and_store_chunks(
+        db=db,
+        contract_id=contract_id,
+        document_text=document_text,
+        coord_index=coord_index,
+    )
+    contract.document_vector = mean_pool_vector
     await db.flush()
 
-    # LLM-based extraction with PDF coordinate mapping
+    # ── Phase 4: Rule resolution + optional auto-classification ──────────────
     active_rules = await _load_active_rules(db, contract_type, agreement_type)
-    if active_rules:
+    rule_payloads: List[Dict[str, Any]]
+    auto_classified = False
+
+    if not active_rules:
+        resolved_ct, resolved_at, rule_payloads = await _classify_and_inject_rules(
+            document_text=document_text,
+            submitted_contract_type=contract_type,
+            submitted_agreement_type=agreement_type,
+            db=db,
+            contract_id=contract_id,
+        )
+        # Update contract with corrected classification if LLM changed it.
+        contract.contract_type = resolved_ct
+        contract.agreement_type = resolved_at
+        auto_classified = True
+        await _write_audit(
+            db, contract_id, "LLM_CLASSIFIED", "SYSTEM_AI",
+            "contract_type/agreement_type",
+            f"{contract_type}/{agreement_type}",
+            f"{resolved_ct}/{resolved_at}",
+        )
+    else:
+        rule_payloads = [_build_rule_payload(r) for r in active_rules]
+
+    # ── Phase 3: LangGraph agentic extraction ─────────────────────────────────
+    any_manual_review = False
+    if rule_payloads:
         extracted_params = await extraction_engine.run_extraction_for_rules(
             document_text=document_text,
-            rules=[_build_rule_payload(r) for r in active_rules],
+            rules=rule_payloads,
             file_bytes=file_bytes,
             content_type=content_type,
+            coord_index=coord_index,
+            db=db,
+            contract_id=contract_id,
         )
         for item in extracted_params:
+            if item.get("requires_manual_review"):
+                any_manual_review = True
             db.add(ContractParameterExtracted(
                 contract_id=contract_id,
                 header_name=item["header_name"],
@@ -377,7 +646,16 @@ async def upload_contract(
                 is_user_added=False,
             ))
 
-    await _write_audit(db, contract_id, "UPLOAD", user_id, "workflow_state", None, "STAGED_DRAFT")
+    # ── Circuit-breaker workflow escalation ───────────────────────────────────
+    if any_manual_review:
+        contract.workflow_state = "MANUAL_REVIEW"
+        await _write_audit(
+            db, contract_id, "MANUAL_REVIEW_REQUIRED", "SYSTEM_EXTRACTION_ENGINE",
+            "workflow_state", "STAGED_DRAFT", "MANUAL_REVIEW",
+        )
+    else:
+        await _write_audit(db, contract_id, "UPLOAD", user_id, "workflow_state", None, contract.workflow_state)
+
     await db.commit()
 
     saved = await _load_contract(db, contract_id)
@@ -387,6 +665,7 @@ async def upload_contract(
 
 
 # ── Serve raw document (for PDF viewer) ───────────────────────────────────────
+
 
 @router.get("/{contract_id}/document")
 async def get_contract_document(contract_id: str, db: AsyncSession = Depends(get_db)):
@@ -601,6 +880,9 @@ async def add_parameter_from_search(
         rules=[{"parameter_head": payload.parameter_head, "parameter_name": payload.parameter_name, "parameter_logic": payload.query}],
         file_bytes=contract.document_blob,
         content_type=contract.uploaded_content_type,
+        coord_index=None,          # Not available from stored state; spatial uses chunk DB.
+        db=db,
+        contract_id=contract_id,
     )
     item = extracted[0]
     if not item.get("original_extract"):
@@ -810,6 +1092,9 @@ async def re_extract_contract(
         rules=[_build_rule_payload(r) for r in active_rules],
         file_bytes=contract.document_blob,
         content_type=contract.uploaded_content_type,
+        coord_index=None,          # Not available from stored state; chunk vectors used for RAG.
+        db=db,
+        contract_id=contract_id,
     )
 
     parameters_filled = 0

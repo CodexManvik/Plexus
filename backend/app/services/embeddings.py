@@ -96,8 +96,8 @@ def _get_model():
 
 def embed(text_input: str) -> Optional[List[float]]:
     """
-    Returns a 384-dim float list for `text_input`, or None if the model
-    is unavailable.
+    Returns a float list of length settings.embedding_vector_dim for `text_input`,
+    or None if the model is unavailable.
     """
     model = _get_model()
     if model is None or not text_input or not text_input.strip():
@@ -126,6 +126,45 @@ def embed(text_input: str) -> Optional[List[float]]:
         return None
 
 
+def embed_batch(texts: List[str]) -> List[Optional[List[float]]]:
+    """
+    Vectorizes a list of strings in a single model call where possible.
+    Returns a list of the same length; entries are None if the text is empty
+    or if the model is unavailable.
+    """
+    model = _get_model()
+    if model is None:
+        return [None] * len(texts)
+
+    results: List[Optional[List[float]]] = []
+
+    if _model_backend == "llama_cpp":
+        # llama_cpp does not expose a native batch encode; fall back to sequential.
+        for text in texts:
+            results.append(embed(text))
+        return results
+
+    # sentence_transformers supports true batch encoding.
+    non_empty_indices = [i for i, t in enumerate(texts) if t and t.strip()]
+    non_empty_texts = [texts[i] for i in non_empty_indices]
+
+    if not non_empty_texts:
+        return [None] * len(texts)
+
+    try:
+        vectors = model.encode(non_empty_texts, normalize_embeddings=True, show_progress_bar=False)
+    except Exception as exc:
+        print(f"[Embeddings] batch encode error: {exc}", file=sys.stderr)
+        return [None] * len(texts)
+
+    # Re-assemble into original index positions.
+    output: List[Optional[List[float]]] = [None] * len(texts)
+    for result_idx, original_idx in enumerate(non_empty_indices):
+        vec = vectors[result_idx]
+        output[original_idx] = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+    return output
+
+
 def serialize(vector: Optional[List[float]]) -> Optional[str]:
     """Serializes a vector to JSON string for CLOB storage (ORM path)."""
     if vector is None:
@@ -151,11 +190,8 @@ async def vector_search_parameters(
     if query_vec is None:
         return []
 
-    # Oracle 23ai native vector literal syntax: TO_VECTOR('[0.1, 0.2, ...]')
-    vec_literal = f"TO_VECTOR('{json.dumps(query_vec)}')"
-
     contract_filter = ""
-    bind_params: dict = {"top_k": top_k}
+    bind_params: dict = {"top_k": top_k, "query_vec": json.dumps(query_vec)}
     if contract_ids:
         placeholders = ", ".join(f":cid{i}" for i in range(len(contract_ids)))
         contract_filter = f"AND p.contract_id IN ({placeholders})"
@@ -177,7 +213,7 @@ async def vector_search_parameters(
             p.source_query,
             p.is_user_added,
             p.is_verified,
-            VECTOR_DISTANCE(p.vector_embed, {vec_literal}, COSINE) AS distance
+            VECTOR_DISTANCE(p.vector_embed, TO_VECTOR(:query_vec), COSINE) AS distance
         FROM contract_parameters_extracted p
         WHERE p.vector_embed IS NOT NULL
         {contract_filter}
@@ -194,6 +230,68 @@ async def vector_search_parameters(
         return []
 
 
+async def vector_search_chunks(
+    db: AsyncSession,
+    query_text: str,
+    contract_id: str,
+    top_k: int = 5,
+) -> List[dict]:
+    """
+    Cosine similarity search scoped to a single contract's paragraph-level chunks.
+    Used by the LangGraph Extractor node to retrieve relevant document context
+    without loading the entire document text into the LLM prompt.
+    Falls back to empty list if embeddings are unavailable or table is empty.
+    """
+    query_vec = embed(query_text)
+    if query_vec is None:
+        return []
+
+    sql = text("""
+        SELECT
+            c.chunk_id,
+            c.contract_id,
+            c.chunk_index,
+            c.chunk_text,
+            c.char_start,
+            c.char_end,
+            c.spatial_json,
+            VECTOR_DISTANCE(c.chunk_vector, TO_VECTOR(:query_vec), COSINE) AS distance
+        FROM contract_document_chunks c
+        WHERE c.contract_id = :contract_id
+          AND c.chunk_vector IS NOT NULL
+        ORDER BY distance ASC
+        FETCH FIRST :top_k ROWS ONLY
+    """)
+
+    try:
+        result = await db.execute(sql, {"contract_id": contract_id, "top_k": top_k, "query_vec": json.dumps(query_vec)})
+        rows = result.mappings().all()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        exc_str = str(exc).lower()
+        # ORA-00942: table or view does not exist — DDL not yet applied.
+        if "942" in exc_str or "does not exist" in exc_str or "table" in exc_str:
+            if not getattr(vector_search_chunks, "_ddl_warning_emitted", False):
+                print(
+                    "[VectorSearch] WARNING: 'contract_document_chunks' table not found in Oracle. "
+                    "Run the new DDL from schema_oracle26ai.sql (CREATE TABLE contract_document_chunks ...). "
+                    "Falling back to document_text head+tail for extraction context.",
+                    file=sys.stderr,
+                )
+                vector_search_chunks._ddl_warning_emitted = True  # type: ignore[attr-defined]
+        elif "vector" in exc_str:
+            if not getattr(vector_search_chunks, "_vector_warning_emitted", False):
+                print(
+                    "[VectorSearch] WARNING: Oracle VECTOR type not supported on this instance. "
+                    "Requires Oracle 23ai. Chunk vector search disabled.",
+                    file=sys.stderr,
+                )
+                vector_search_chunks._vector_warning_emitted = True  # type: ignore[attr-defined]
+        else:
+            print(f"[VectorSearch] Chunk vector search failed: {exc}", file=sys.stderr)
+        return []
+
+
 async def vector_search_documents(
     db: AsyncSession,
     query_text: str,
@@ -207,16 +305,14 @@ async def vector_search_documents(
     if query_vec is None:
         return []
 
-    vec_literal = f"TO_VECTOR('{json.dumps(query_vec)}')"
-
-    sql = text(f"""
+    sql = text("""
         SELECT
             c.contract_id,
             c.contract_type,
             c.agreement_type,
             c.organization,
             c.uploaded_filename,
-            VECTOR_DISTANCE(c.document_vector, {vec_literal}, COSINE) AS distance
+            VECTOR_DISTANCE(c.document_vector, TO_VECTOR(:query_vec), COSINE) AS distance
         FROM contracts_master c
         WHERE c.document_vector IS NOT NULL
         ORDER BY distance ASC
@@ -224,7 +320,7 @@ async def vector_search_documents(
     """)
 
     try:
-        result = await db.execute(sql, {"top_k": top_k})
+        result = await db.execute(sql, {"top_k": top_k, "query_vec": json.dumps(query_vec)})
         rows = result.mappings().all()
         return [dict(row) for row in rows]
     except Exception as exc:

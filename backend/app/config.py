@@ -66,6 +66,13 @@ class Settings(BaseSettings):
     )
     lock_lease_minutes: int = Field(default=15, validation_alias="LOCK_LEASE_MINUTES")
     dashboard_horizon_days: int = Field(default=30, validation_alias="DASHBOARD_HORIZON_DAYS")
+
+    # Parsing engine — set USE_MARKER_PARSER=true only when marker-pdf is manually
+    # installed and GPU/CPU resources allow. Default is CPU-only PyMuPDF.
+    use_marker_parser: bool = Field(default=False, validation_alias="USE_MARKER_PARSER")
+
+    # LangGraph critic circuit-breaker: maximum re-tries before flagging MANUAL_REVIEW.
+    extraction_max_critic_retries: int = Field(default=2, validation_alias="EXTRACTION_MAX_CRITIC_RETRIES")
     
 
     @field_validator("cors_origins", mode="before")
