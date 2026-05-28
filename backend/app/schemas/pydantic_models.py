@@ -213,6 +213,13 @@ class ExtractionStatusResponse(BaseModel):
     percentage: int
 
 
+class ReExtractionResponse(BaseModel):
+    contract_id: str
+    rules_applied: int
+    parameters_written: int
+    parameters_filled: int
+
+
 class MasterRuleBase(BaseModel):
     contract_type: str
     agreement_type: str

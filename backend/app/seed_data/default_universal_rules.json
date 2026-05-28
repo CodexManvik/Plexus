@@ -1,0 +1,191 @@
+[
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Parties & Stakeholders",
+    "parameter_name": "Party Names & Roles",
+    "parameter_logic": "party names vendor supplier client customer submitted to submitted by",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Contract Dates",
+    "parameter_name": "Contract Term / Duration",
+    "parameter_logic": "contract term duration start date end date period from to year",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Commercial & Financial Terms",
+    "parameter_name": "Payment Terms & Rates",
+    "parameter_logic": "payment invoice amount rate charges AUD USD monthly annual billing consideration",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Legal & Compliance Terms",
+    "parameter_name": "Governing Law & Jurisdiction",
+    "parameter_logic": "governing law jurisdiction court dispute resolution arbitration",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Contract Dates",
+    "parameter_name": "Termination / Notice Period",
+    "parameter_logic": "termination notice period months days written terminate exit",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Scope of Work",
+    "parameter_name": "Services / Deliverables Description",
+    "parameter_logic": "scope services deliverables work support application functional technical",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Risk, Liability & Indemnity",
+    "parameter_name": "Indemnification",
+    "parameter_logic": "indemnify indemnification liability damages hold harmless claims losses",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Risk, Liability & Indemnity",
+    "parameter_name": "Insurance Requirements",
+    "parameter_logic": "insurance liability indemnity professional workers compensation coverage",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Confidentiality & Data Handling",
+    "parameter_name": "Confidentiality Obligations",
+    "parameter_logic": "confidential information disclosure non-disclosure secret proprietary",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "UNIVERSAL",
+    "agreement_type": "UNIVERSAL",
+    "parameter_head": "Special Clauses",
+    "parameter_name": "Intellectual Property Rights",
+    "parameter_logic": "intellectual property rights ownership patent copyright trademark assignment",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Sale Agreement",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Scope of Work",
+    "parameter_name": "Services Description",
+    "parameter_logic": "scope services support application functional technical deliverables",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Sale Agreement",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Commercial & Financial Terms",
+    "parameter_name": "Pricing & Payment Terms",
+    "parameter_logic": "payment invoice amount rate charges AUD monthly billing fixed",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Sale Agreement",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Contract Dates",
+    "parameter_name": "Contract Duration",
+    "parameter_logic": "contract term duration period start end date from to year",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Sale Agreement",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Penalties & Performance Metrics",
+    "parameter_name": "SLA & Response Times",
+    "parameter_logic": "SLA service level response time resolution uptime hours support",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Sale Agreement",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Contract Dates",
+    "parameter_name": "Termination Notice",
+    "parameter_logic": "termination notice period months written terminate either party",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Consultancy Agreement",
+    "agreement_type": "Employment & HR Contracts",
+    "parameter_head": "Scope of Work",
+    "parameter_name": "Scope of Consulting Services",
+    "parameter_logic": "consulting services scope deliverables project advisory",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Consultancy Agreement",
+    "agreement_type": "Employment & HR Contracts",
+    "parameter_head": "Commercial & Financial Terms",
+    "parameter_name": "Consulting Fees",
+    "parameter_logic": "consulting fees rate daily hourly monthly retainer payment",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "SaaS Agreement",
+    "agreement_type": "Technology & IT Contracts",
+    "parameter_head": "Scope of Work",
+    "parameter_name": "Software Features / Modules",
+    "parameter_logic": "software features modules functionality subscription access",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "SaaS Agreement",
+    "agreement_type": "Technology & IT Contracts",
+    "parameter_head": "Commercial & Financial Terms",
+    "parameter_name": "Subscription Pricing",
+    "parameter_logic": "subscription price monthly annual per user per seat pricing tier",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Purchase Agreement",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Commercial & Financial Terms",
+    "parameter_name": "Purchase Price",
+    "parameter_logic": "purchase price consideration amount payment total cost",
+    "is_active": true,
+    "created_by": "system-seed"
+  },
+  {
+    "contract_type": "Purchase Agreement",
+    "agreement_type": "Commercial & Business Contracts",
+    "parameter_head": "Delivery & Logistics",
+    "parameter_name": "Delivery Terms",
+    "parameter_logic": "delivery terms timeline schedule milestones handover",
+    "is_active": true,
+    "created_by": "system-seed"
+  }
+]

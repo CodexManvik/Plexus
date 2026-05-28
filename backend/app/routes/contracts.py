@@ -40,6 +40,7 @@ from app.schemas.pydantic_models import (
     ParameterResponse,
     ParameterUpdateRequest,
     ParameterVerifyRequest,
+    ReExtractionResponse,
     WorkflowActionRequest,
 )
 from app.services.document_parser import extract_document_text
@@ -174,6 +175,30 @@ async def _upsert_metadata_option(db: AsyncSession, category: str, value: Option
 async def _load_active_rules(
     db: AsyncSession, contract_type: str, agreement_type: str
 ) -> List[MasterExtractionRule]:
+    """
+    Rule resolution order (most specific → least specific):
+    1. UNIVERSAL rules always loaded (contract_type="UNIVERSAL")
+    2. Exact match: contract_type + agreement_type  (specific rules)
+    3. Fallback: contract_type only
+    4. Fallback: agreement_type only (excluding UNIVERSAL to avoid dupes)
+ 
+    Specific rules take precedence; UNIVERSAL rules fill remaining slots.
+    This guarantees every upload gets the 10 core parameters extracted
+    regardless of contract classification.
+    """
+    # Always load UNIVERSAL rules
+    universal_q = await db.execute(
+        select(MasterExtractionRule).where(
+            and_(
+                MasterExtractionRule.is_active == True,
+                MasterExtractionRule.contract_type == "UNIVERSAL",
+                MasterExtractionRule.agreement_type == "UNIVERSAL",
+            )
+        )
+    )
+    universal_rules = universal_q.scalars().all()
+ 
+    # Try exact match
     exact = await db.execute(
         select(MasterExtractionRule).where(
             and_(
@@ -183,28 +208,43 @@ async def _load_active_rules(
             )
         )
     )
-    rules = exact.scalars().all()
-    if rules:
-        return rules
-    fallback = await db.execute(
-        select(MasterExtractionRule).where(
-            and_(MasterExtractionRule.is_active == True, MasterExtractionRule.contract_type == contract_type)
-        )
-    )
-    rules = fallback.scalars().all()
-    if rules:
-        return rules
-
-    # Category fallback: if no specific rules match the contract type, load general rules of the agreement type (category)
-    fallback_agreement = await db.execute(
-        select(MasterExtractionRule).where(
-            and_(
-                MasterExtractionRule.is_active == True,
-                MasterExtractionRule.agreement_type == agreement_type,
+    specific_rules = exact.scalars().all()
+ 
+    if not specific_rules:
+        # Fallback: contract_type only (exclude UNIVERSAL)
+        ct_only = await db.execute(
+            select(MasterExtractionRule).where(
+                and_(
+                    MasterExtractionRule.is_active == True,
+                    MasterExtractionRule.contract_type == contract_type,
+                    MasterExtractionRule.contract_type != "UNIVERSAL",
+                )
             )
         )
-    )
-    return fallback_agreement.scalars().all()
+        specific_rules = ct_only.scalars().all()
+ 
+    if not specific_rules:
+        # Fallback: agreement_type only (exclude UNIVERSAL to avoid duplicates)
+        at_only = await db.execute(
+            select(MasterExtractionRule).where(
+                and_(
+                    MasterExtractionRule.is_active == True,
+                    MasterExtractionRule.agreement_type == agreement_type,
+                    MasterExtractionRule.contract_type != "UNIVERSAL",
+                )
+            )
+        )
+        specific_rules = at_only.scalars().all()
+ 
+    # Deduplicate: specific rules win over universal on same (head, name) key
+    seen = {(r.parameter_head, r.parameter_name) for r in specific_rules}
+    deduped_universal = [
+        r for r in universal_rules
+        if (r.parameter_head, r.parameter_name) not in seen
+    ]
+ 
+    return list(specific_rules) + deduped_universal
+
 
 
 def _build_rule_payload(rule: MasterExtractionRule) -> Dict[str, Any]:
@@ -708,4 +748,100 @@ async def get_extraction_status(contract_id: str, db: AsyncSession = Depends(get
         contract_id=contract_id, status=contract.workflow_state,
         total=total, extracted=extracted, verified=verified,
         percentage=int((verified / total) * 100) if total else 0,
+    )
+
+
+@router.post("/{contract_id}/re-extract", response_model=ReExtractionResponse)
+async def re_extract_contract(
+    contract_id: str,
+    payload: WorkflowActionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Re-runs LLM extraction for an already-uploaded contract.
+
+    Use this after:
+    - Fixing LLM provider configuration (e.g. swapping Cohere model)
+    - Adding/modifying extraction rules for the contract's type
+    - Any situation where the initial extraction produced empty fields
+
+    All non-user-added parameters are deleted and replaced with fresh
+    LLM output.  User-added parameters (is_user_added=True) are preserved.
+    """
+    contract = await _load_contract(db, contract_id)
+    if contract is None:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    if not contract.document_text:
+        raise HTTPException(
+            status_code=422,
+            detail="Contract has no stored document text; re-upload the file.",
+        )
+
+    # Delete all LLM-generated parameters (preserve user-added ones)
+    result = await db.execute(
+        select(ContractParameterExtracted).where(
+            ContractParameterExtracted.contract_id == contract_id,
+            ContractParameterExtracted.is_user_added == False,  # noqa: E712
+        )
+    )
+    stale_params = result.scalars().all()
+    for p in stale_params:
+        await db.delete(p)
+    await db.flush()
+
+    # Resolve rule set using the contract's stored classification
+    active_rules = await _load_active_rules(
+        db, contract.contract_type or "", contract.agreement_type or ""
+    )
+
+    if not active_rules:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No active extraction rules found for contract_type=\"{contract.contract_type}\" "
+                f"/ agreement_type=\"{contract.agreement_type}\". "
+                "Add UNIVERSAL rules or create rules for this combination."
+            ),
+        )
+
+    extracted_params = await extraction_engine.run_extraction_for_rules(
+        document_text=contract.document_text,
+        rules=[_build_rule_payload(r) for r in active_rules],
+        file_bytes=contract.document_blob,
+        content_type=contract.uploaded_content_type,
+    )
+
+    parameters_filled = 0
+    for item in extracted_params:
+        if item.get("original_extract"):
+            parameters_filled += 1
+        db.add(ContractParameterExtracted(
+            contract_id=contract_id,
+            header_name=item["header_name"],
+            param_name=item["param_name"],
+            original_extract=item["original_extract"],
+            user_override=item["user_override"],
+            match_score=item["match_score"],
+            citation_text=item["citation_text"],
+            citation_start=item["citation_start"],
+            citation_end=item["citation_end"],
+            spatial_json=item["spatial_json"],
+            vector_embed=item["vector_embed"],
+            source_query=item["source_query"],
+            is_user_added=False,
+        ))
+
+    await _write_audit(
+        db, contract_id, "RE_EXTRACT", payload.modified_by,
+        "parameters", f"{len(stale_params)} stale rows deleted",
+        f"{len(extracted_params)} rows written, {parameters_filled} filled",
+    )
+    await db.commit()
+
+    return ReExtractionResponse(
+        contract_id=contract_id,
+        rules_applied=len(active_rules),
+        parameters_written=len(extracted_params),
+        parameters_filled=parameters_filled,
     )

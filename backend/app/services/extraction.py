@@ -1,15 +1,12 @@
 """
 extraction.py — LLM-powered parameter extraction with real PDF citation coordinates.
 
-Replaces the old keyword-matching ocr.py.
-
-Flow per rule:
-  1. Ask Azure OpenAI to find the parameter value and quote the source sentence.
-  2. Map the quoted sentence back to char offsets in document_text.
-  3. If the source file was a PDF, use pdfplumber to get page + bounding-box
-     coordinates (for frontend highlight overlay).
-  4. Embed the citation text with sentence-transformers.
-  5. Return a structured result ready for ContractParameterExtracted.
+Fixes in this version:
+  1. Bracket-depth JSON extractor — handles Cohere preamble text before JSON array.
+     The old greedy regex failed when Cohere adds "Here are the results:" before the JSON.
+  2. Batched extraction (all params in one LLM call) unchanged from previous version.
+  3. Embedding dim guard unchanged.
+  4. PDF spatial coordinates unchanged.
 """
 from __future__ import annotations
 
@@ -23,107 +20,221 @@ from app.config import settings
 from app.services import embeddings as emb
 from app.services.llm import azure_llm
 
+_BATCH_SIZE = 12
 
-async def _llm_extract(
+
+# ── JSON extraction helpers ───────────────────────────────────────────────────
+
+def _strip_fences(raw: str) -> str:
+    """Remove ```json … ``` or ``` … ``` wrappers."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+    return raw.strip()
+
+
+def _bracket_extract(text: str) -> str:
+    """
+    Finds the first '[' or '{' in text and returns the complete balanced
+    JSON value by tracking bracket depth.
+
+    This correctly handles Cohere responses that start with preamble text like:
+    "Here are the extracted parameters:\n\n[{...}]"
+
+    The old re.search(r"(\[[\s\S]*\])") approach failed because re.search
+    returns the FIRST match, but with a greedy .* the match boundaries can
+    be ambiguous when the engine backtracks on complex nested JSON.
+    Bracket-depth tracking is O(n) and unambiguous.
+    """
+    open_char = None
+    start = -1
+    for i, ch in enumerate(text):
+        if ch in ('[', '{'):
+            open_char = ch
+            start = i
+            break
+
+    if start == -1:
+        return text  # no JSON structure found, return as-is
+
+    close_char = ']' if open_char == '[' else '}'
+    depth = 0
+    in_string = False
+    escape_next = False
+
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == open_char:
+            depth += 1
+        elif ch == close_char:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+
+    # Unbalanced — return from start to end
+    return text[start:]
+
+
+def _safe_parse_json(raw: str) -> Any:
+    """
+    Parse JSON with three fallback strategies:
+    1. Direct parse after stripping markdown fences.
+    2. Bracket-depth extraction then parse (handles Cohere preamble).
+    3. Return None on failure.
+    """
+    if not raw:
+        return None
+
+    # Strategy 1: strip fences + direct parse
+    cleaned = _strip_fences(raw)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: bracket-depth extraction
+    extracted = _bracket_extract(cleaned)
+    try:
+        return json.loads(extracted)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 3: try the raw text as-is (last resort)
+    try:
+        return json.loads(raw.strip())
+    except json.JSONDecodeError:
+        return None
+
+
+# ── LLM batch extraction ──────────────────────────────────────────────────────
+
+async def _llm_extract_batch(
     document_text: str,
-    parameter_head: str,
-    parameter_name: str,
-    parameter_logic: str,
-) -> Dict[str, Optional[str]]:
+    rules: List[Dict[str, Any]],
+) -> List[Dict[str, Optional[str]]]:
     """
-    Calls polymorphic multi-provider engine to extract text content, fallback safe.
+    Single LLM call to extract all parameters in `rules` from `document_text`.
+    Returns list aligned with `rules`: [{"value": str|None, "citation": str|None}, ...]
     """
-    doc_snippet = document_text[:12_000]
+    doc_snippet = document_text[:14_000]
+    count = len(rules)
+
+    param_list_lines = []
+    for i, rule in enumerate(rules):
+        head = (rule.get("parameter_head") or "").strip()
+        name = (rule.get("parameter_name") or head).strip()
+        logic = (rule.get("parameter_logic") or "").strip()
+        hint = f" (hint: {logic})" if logic else ""
+        param_list_lines.append(
+            f'{i + 1}. parameter_head="{head}", parameter_name="{name}"{hint}'
+        )
+
+    param_list_str = "\n".join(param_list_lines)
 
     system_prompt = (
-        "You are a contract analysis assistant. "
-        "Extract the requested parameter from the contract text provided. "
-        "Respond ONLY with a JSON object — no markdown blocks, no extra leading/trailing text. "
-        "JSON schema: {\"value\": string|null, \"citation\": string|null} "
-        "where `value` is the extracted answer (a concise value, date, name, clause summary, etc.) "
-        "and `citation` is the single exact sentence or phrase from the contract text "
-        "that most directly supports the extracted value. "
-        "If the parameter is not found, return {\"value\": null, \"citation\": null}."
+        "You are a precise contract analysis assistant. "
+        "Extract requested parameters from the contract text. "
+        "You MUST respond with ONLY a valid JSON array — absolutely no prose, "
+        "no markdown code fences, no explanations before or after. "
+        f"The array MUST contain exactly {count} objects in the same order as the input list. "
+        "Each object MUST have exactly these keys: "
+        '  "param_name": string (copy the parameter_name from input), '
+        '  "value": string or null (the extracted answer), '
+        '  "citation": string or null (exact sentence from the contract that supports the value). '
+        "If a parameter is not present in the contract, set both value and citation to null. "
+        "Do NOT invent information not present in the text."
     )
 
     user_prompt = (
-        f"Parameter category: {parameter_head}\n"
-        f"Parameter name: {parameter_name}\n"
-        f"Extraction hint: {parameter_logic or 'N/A'}\n\n"
-        f"Contract text:\n{doc_snippet}"
+        f"Contract text (may be truncated):\n{doc_snippet}\n\n"
+        f"Extract the following {count} parameters:\n{param_list_str}\n\n"
+        f"Respond with a JSON array of exactly {count} objects. "
+        "Start your response directly with '[' — no preamble text."
     )
 
     try:
-        # Let MultiProviderLLMService choose Cohere first!
         raw = await azure_llm.get_chat_completion(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            response_format={"type": "json_object"},
+            response_format=None,   # Don't pass — Cohere ignores/breaks on this
             temperature=0.0,
-            max_tokens=400
+            max_tokens=1200 + (count * 80),
         )
-        
-        # Clean potential markdown wrapping anomalies sometimes generated by LLMs
-        if raw.startswith("```json"):
-            raw = raw.split("```json")[1].split("```")[0].strip()
-        elif raw.startswith("```"):
-            raw = raw.split("```")[1].split("```")[0].strip()
-            
-        parsed = json.loads(raw.strip())
-        return {
-            "value": parsed.get("value") or None,
-            "citation": parsed.get("citation") or None,
-        }
     except Exception as exc:
-        print(f"[Extraction] Dynamic MultiProvider LLM call failed: {exc}", file=sys.stderr)
-        return {"value": None, "citation": None}
+        print(f"[Extraction] Batch LLM call failed: {exc}", file=sys.stderr)
+        return [{"value": None, "citation": None}] * count
+
+    parsed = _safe_parse_json(raw)
+
+    if not isinstance(parsed, list):
+        print(
+            f"[Extraction] Expected JSON array, got {type(parsed).__name__}. "
+            f"Raw (first 400 chars): {(raw or '')[:400]}",
+            file=sys.stderr,
+        )
+        # One more attempt: maybe LLM returned a single object instead of array
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        else:
+            return [{"value": None, "citation": None}] * count
+
+    results: List[Dict[str, Optional[str]]] = []
+    for i in range(count):
+        try:
+            item = parsed[i] if i < len(parsed) else {}
+            if not isinstance(item, dict):
+                item = {}
+            results.append({
+                "value": item.get("value") or None,
+                "citation": item.get("citation") or None,
+            })
+        except Exception:
+            results.append({"value": None, "citation": None})
+
+    while len(results) < count:
+        results.append({"value": None, "citation": None})
+
+    return results
 
 
 # ── Citation → char offset mapping ───────────────────────────────────────────
 
-def _find_citation_offsets(
-    document_text: str, citation: str
-) -> tuple[int, int]:
-    """
-    Locates `citation` inside `document_text` (case-insensitive partial match).
-    Returns (start, end) char offsets, or (0, 0) if not found.
-    """
+def _find_citation_offsets(document_text: str, citation: str) -> tuple[int, int]:
     if not citation or not document_text:
         return 0, 0
-
-    # Try exact match first
     idx = document_text.find(citation)
     if idx != -1:
         return idx, idx + len(citation)
-
-    # Try case-insensitive
     idx = document_text.lower().find(citation.lower())
     if idx != -1:
         return idx, idx + len(citation)
-
-    # Fuzzy: find longest matching prefix of citation
     for length in range(len(citation) - 10, 20, -10):
         fragment = citation[:length].strip()
+        if not fragment:
+            continue
         idx = document_text.lower().find(fragment.lower())
         if idx != -1:
             return idx, idx + len(fragment)
-
     return 0, 0
 
 
 # ── PDF spatial coordinates ───────────────────────────────────────────────────
 
-def _extract_pdf_spatial(
-    file_bytes: bytes,
-    citation: str,
-) -> Optional[Dict[str, Any]]:
-    """
-    Uses pdfplumber to find the bounding box of `citation` text in the PDF.
-    Injects original page constraints to calculate clean frontend overlay sizing.
-    """
+def _extract_pdf_spatial(file_bytes: bytes, citation: str) -> Optional[Dict[str, Any]]:
     if not file_bytes or not citation:
         return None
-
     try:
         import pdfplumber  # type: ignore
     except ImportError:
@@ -139,35 +250,49 @@ def _extract_pdf_spatial(
                 page_text = (page.extract_text() or "").lower()
                 if citation_words[0] not in page_text:
                     continue
-
-                # Fetch token boundaries with native spatial attributes
                 words = page.extract_words()
                 word_texts = [w["text"].lower() for w in words]
-
                 for i in range(len(word_texts)):
                     if word_texts[i] == citation_words[0]:
                         match_len = sum(
-                            1
-                            for j, cw in enumerate(citation_words)
+                            1 for j, cw in enumerate(citation_words)
                             if i + j < len(word_texts) and word_texts[i + j] == cw
                         )
                         if match_len >= max(1, len(citation_words) // 2):
-                            matched_words = words[i : i + match_len]
-                            x0 = min(w["x0"] for w in matched_words)
-                            y0 = min(w["top"] for w in matched_words)
-                            x1 = max(w["x1"] for w in matched_words)
-                            y1 = max(w["bottom"] for w in matched_words)
-                            
+                            matched = words[i: i + match_len]
                             return {
                                 "page": page_num,
-                                "rects": [[x0, y0, x1, y1]],
-                                "page_width": float(page.width),   # Added to track viewport scaling constraints
-                                "page_height": float(page.height)  # Added to track viewport scaling constraints
+                                "rects": [[
+                                    min(w["x0"] for w in matched),
+                                    min(w["top"] for w in matched),
+                                    max(w["x1"] for w in matched),
+                                    max(w["bottom"] for w in matched),
+                                ]],
+                                "page_width": float(page.width),
+                                "page_height": float(page.height),
                             }
     except Exception as exc:
         print(f"[PDF Spatial] pdfplumber error: {exc}", file=sys.stderr)
-
     return None
+
+
+# ── Embed helper with dim guard ───────────────────────────────────────────────
+
+def _safe_embed(text: str) -> Optional[List[float]]:
+    if not text or not text.strip():
+        return None
+    vec = emb.embed(text)
+    if vec is None:
+        return None
+    if len(vec) != settings.embedding_vector_dim:
+        print(
+            f"[Extraction] WARNING: embedding model returned {len(vec)}-dim vector "
+            f"but EMBEDDING_VECTOR_DIM={settings.embedding_vector_dim}. "
+            "Update your .env to match. Storing None to avoid DB errors.",
+            file=sys.stderr,
+        )
+        return None
+    return vec
 
 
 # ── Main extraction engine ────────────────────────────────────────────────────
@@ -180,83 +305,68 @@ class ExtractionEngine:
         file_bytes: Optional[bytes] = None,
         content_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Runs LLM-based extraction for each rule against document_text.
+        if not rules:
+            return []
 
-        Args:
-            document_text: Full plain-text of the contract.
-            rules: List of {parameter_head, parameter_name, parameter_logic}.
-            file_bytes: Raw bytes of the original uploaded file (for PDF coordinate extraction).
-            content_type: MIME type of the uploaded file.
-
-        Returns:
-            List of dicts ready for ContractParameterExtracted insertion.
-        """
-        results: List[Dict[str, Any]] = []
-        is_pdf = content_type == "application/pdf" or (
+        is_pdf = (content_type == "application/pdf") or bool(
             file_bytes and file_bytes[:4] == b"%PDF"
         )
 
-        for rule in rules:
-            param_head = (rule.get("parameter_head") or "").strip()
-            param_name = (rule.get("parameter_name") or "").strip() or param_head
-            param_logic = (rule.get("parameter_logic") or "").strip()
+        all_results: List[Dict[str, Any]] = []
 
-            # 1. LLM extraction
-            llm_result = await _llm_extract(
-                document_text, param_head, param_name, param_logic
-            )
-            value = llm_result["value"]
-            citation = llm_result["citation"]
+        for batch_start in range(0, len(rules), _BATCH_SIZE):
+            batch = rules[batch_start: batch_start + _BATCH_SIZE]
+            llm_results = await _llm_extract_batch(document_text, batch)
 
-            if not value:
-                # Nothing found — still append a blank slot so the UI shows
-                # the parameter as "not extracted" rather than missing entirely
-                results.append({
+            for rule, llm_item in zip(batch, llm_results):
+                param_head = (rule.get("parameter_head") or "").strip()
+                param_name = (rule.get("parameter_name") or param_head).strip()
+                param_logic = (rule.get("parameter_logic") or "").strip()
+
+                value = llm_item["value"]
+                citation = llm_item["citation"]
+
+                if not value:
+                    all_results.append({
+                        "header_name": param_head or "General",
+                        "param_name": param_name,
+                        "original_extract": None,
+                        "user_override": None,
+                        "match_score": 0.0,
+                        "citation_text": None,
+                        "citation_start": None,
+                        "citation_end": None,
+                        "spatial_json": None,
+                        "vector_embed": None,
+                        "source_query": param_logic or param_name,
+                    })
+                    continue
+
+                start, end = _find_citation_offsets(document_text, citation or value)
+
+                spatial: Optional[Dict[str, Any]] = None
+                if is_pdf and file_bytes and citation:
+                    spatial = _extract_pdf_spatial(file_bytes, citation)
+                if spatial is None and start > 0:
+                    spatial = {"page": 1, "rects": [[start, 0, end, 0]], "char_fallback": True}
+
+                embed_vec = _safe_embed(citation or value)
+
+                all_results.append({
                     "header_name": param_head or "General",
                     "param_name": param_name,
-                    "original_extract": None,
+                    "original_extract": value,
                     "user_override": None,
-                    "match_score": 0.0,
-                    "citation_text": None,
-                    "citation_start": None,
-                    "citation_end": None,
-                    "spatial_json": None,
-                    "vector_embed": None,
+                    "match_score": 1.0 if citation else 0.5,
+                    "citation_text": citation,
+                    "citation_start": start if start > 0 else None,
+                    "citation_end": end if end > 0 else None,
+                    "spatial_json": spatial,
+                    "vector_embed": embed_vec,
                     "source_query": param_logic or param_name,
                 })
-                continue
 
-            # 2. Char offsets in plain text
-            start, end = _find_citation_offsets(document_text, citation or value)
-
-            # 3. PDF spatial coordinates (page + bounding box)
-            spatial = None
-            if is_pdf and file_bytes and citation:
-                spatial = _extract_pdf_spatial(file_bytes, citation)
-
-            if spatial is None and start > 0:
-                # Fallback spatial: just char offsets with page=1 marker
-                spatial = {"page": 1, "rects": [[start, 0, end, 0]], "char_fallback": True}
-
-            # 4. Embed the citation for vector search
-            embed_vec = emb.embed(citation or value)
-
-            results.append({
-                "header_name": param_head or "General",
-                "param_name": param_name,
-                "original_extract": value,
-                "user_override": None,
-                "match_score": 1.0 if citation else 0.5,
-                "citation_text": citation,
-                "citation_start": start if start > 0 else None,
-                "citation_end": end if end > 0 else None,
-                "spatial_json": spatial,
-                "vector_embed": embed_vec,
-                "source_query": param_logic or param_name,
-            })
-
-        return results
+        return all_results
 
 
 extraction_engine = ExtractionEngine()

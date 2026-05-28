@@ -1,3 +1,10 @@
+"""
+bootstrap.py — Seeds default master rules and metadata options on startup.
+
+Updated to also seed universal rules from default_universal_rules.json.
+Universal rules (contract_type="UNIVERSAL", agreement_type="UNIVERSAL") are
+applied to every contract regardless of its classification.
+"""
 from __future__ import annotations
 
 import json
@@ -19,9 +26,7 @@ def _read_json_file(file_name: str) -> List[Dict[str, Any]]:
         return []
     with file_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
-    if isinstance(data, list):
-        return data
-    return []
+    return data if isinstance(data, list) else []
 
 
 async def _seed_master_rules(session: AsyncSession) -> None:
@@ -40,15 +45,19 @@ async def _seed_master_rules(session: AsyncSession) -> None:
     }
 
     rows: List[MasterExtractionRule] = []
-    for rule in _read_json_file("default_master_rules.json"):
-        key = (
-            rule.get("contract_type"),
-            rule.get("agreement_type"),
-            rule.get("parameter_head"),
-            rule.get("parameter_name"),
-        )
-        if key not in existing:
-            rows.append(MasterExtractionRule(**rule))
+
+    # Seed both the original rules and the new universal + contract-specific rules
+    for file_name in ("default_master_rules.json", "default_universal_rules.json"):
+        for rule in _read_json_file(file_name):
+            key = (
+                rule.get("contract_type"),
+                rule.get("agreement_type"),
+                rule.get("parameter_head"),
+                rule.get("parameter_name"),
+            )
+            if key not in existing:
+                rows.append(MasterExtractionRule(**rule))
+                existing.add(key)  # prevent dupes within same seed run
 
     if rows:
         session.add_all(rows)
@@ -75,5 +84,4 @@ async def _seed_metadata_options(session: AsyncSession) -> None:
 async def seed_defaults(session: AsyncSession) -> None:
     await _seed_master_rules(session)
     await _seed_metadata_options(session)
-
     await session.commit()
