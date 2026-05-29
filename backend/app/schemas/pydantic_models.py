@@ -121,6 +121,7 @@ class AssistantSourceSnippet(BaseModel):
     score: float
     parameter_head: Optional[str] = None
     parameter_name: Optional[str] = None
+    spatial_json: Optional[Any] = None
 
 
 class AssistantQueryRequest(BaseModel):

@@ -65,14 +65,23 @@ class PublishingService:
           5. Copy each ContractDocumentChunk to PublishedChunk.
           6. Write a ContractAuditTrail entry with action_type='PUBLISHED'.
 
-        Does NOT commit \u2014 caller owns the transaction.
+        Does NOT commit — caller owns the transaction.
 
-        Raises
-        ------
-        ValueError
-            If the contract does not exist.
+        Backward-compatible wrapper for promote_draft_to_published.
         """
-        # \u2500\u2500 Idempotency check \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        return await self.promote_draft_to_published(db, contract_id, approved_by)
+
+    async def promote_draft_to_published(
+        self,
+        db: AsyncSession,
+        contract_id: str,
+        approved_by: str,
+    ) -> PublishedContract:
+        """
+        Atomically promotes an approved contract staging workspace (draft) to the published trust zone,
+        and wipes clean the transient staging schemas upon successful promotion.
+        """
+        # ── Idempotency check ──────────────────────────────────────────────────
         existing_publication = await db.execute(
             select(PublishedContract).where(PublishedContract.contract_id == contract_id)
         )
@@ -84,7 +93,7 @@ class PublishingService:
             )
             return existing
 
-        # \u2500\u2500 Load draft master with its relations \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # ── Load draft master with its relations ──────────────────────────────
         result = await db.execute(
             select(ContractMaster)
             .options(
@@ -94,7 +103,7 @@ class PublishingService:
         )
         contract = result.scalars().first()
         if contract is None:
-            raise ValueError(f"Contract '{contract_id}' not found \u2014 cannot promote to published.")
+            raise ValueError(f"Contract '{contract_id}' not found — cannot promote to published.")
 
         # Load chunks separately (ContractMaster may not have a relationship to chunks defined)
         chunk_result = await db.execute(
@@ -155,7 +164,7 @@ class PublishingService:
                 validation_message=param.validation_message,
                 embed_model_name=param.embed_model_name,
                 embed_dimension=param.embed_dimension,
-                embed_quant_type=param.embed_quant_type,
+                embed_quant_type="INT8",
                 parser_version=param.parser_version,
                 chunking_version=param.chunking_version,
                 embed_created_at=param.embed_created_at,
@@ -176,7 +185,7 @@ class PublishingService:
                 chunk_vector=chunk.chunk_vector,
                 embed_model_name=chunk.embed_model_name,
                 embed_dimension=chunk.embed_dimension,
-                embed_quant_type=chunk.embed_quant_type,
+                embed_quant_type="INT8",
                 parser_version=chunk.parser_version,
                 chunking_version=chunk.chunking_version,
                 embed_created_at=chunk.embed_created_at,
@@ -199,10 +208,14 @@ class PublishingService:
         ))
 
         clm_logger.info(
-            f"[Publishing] Promoted contract '{contract_id}' \u2014 "
-            f"{parameter_count} parameters, {chunk_count} chunks \u2014 "
+            f"[Publishing] Promoted contract '{contract_id}' — "
+            f"{parameter_count} parameters, {chunk_count} chunks — "
             f"approved_by='{approved_by}'."
         )
+
+        # ── Wipe Clean Transient Workspace Draft Schemas ──────────────────────
+        clm_logger.info(f"[Publishing] Wiping draft staging records from database workspace for '{contract_id}'...")
+        await db.delete(contract)
 
         return published_contract
 

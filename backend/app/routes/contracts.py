@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status, BackgroundTasks
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -74,6 +74,18 @@ router = APIRouter(prefix="/contracts", tags=["Contracts Workflow"])
 tagging_agent = TaggingAgent()
 risk_agent = RiskAgent()
 validation_service = ValidationService()
+
+_pipeline_logs = {}
+_pipeline_queues = {}
+
+def log_progress(contract_id: str, message: str):
+    clm_logger.info(f"[Pipeline][{contract_id}] {message}")
+    if contract_id not in _pipeline_logs:
+        _pipeline_logs[contract_id] = []
+    _pipeline_logs[contract_id].append(message)
+    if contract_id in _pipeline_queues:
+        for q in _pipeline_queues[contract_id]:
+            q.put_nowait(message)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -728,15 +740,19 @@ async def _execute_extraction_pipeline(db: AsyncSession, contract_id: str, user_
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
+    log_progress(contract_id, "[Pipeline] Commencing contract extraction pipeline...")
+
     # ── Phase 1: EXTRACTION_RUNNING ──────────────────────────────────────────
     contract.workflow_state = "EXTRACTION_RUNNING"
     await db.flush()
+    log_progress(contract_id, "[Stage 1/4] Retrieving rule templates and classification tags...")
 
     active_rules = await _load_active_rules(db, contract.contract_type, contract.agreement_type)
     rule_payloads = [_build_rule_payload(r) for r in active_rules]
 
     # If no rules exist, classify and inject dynamic rules
     if not active_rules:
+        log_progress(contract_id, "[Stage 1/4] No active rules found. Auto-generating rules from document context...")
         resolved_ct, resolved_at, rule_payloads = await _classify_and_inject_rules(
             document_text=contract.document_text,
             submitted_contract_type=contract.contract_type,
@@ -747,10 +763,12 @@ async def _execute_extraction_pipeline(db: AsyncSession, contract_id: str, user_
         contract.contract_type = resolved_ct
         contract.agreement_type = resolved_at
         await db.flush()
+        log_progress(contract_id, f"[Stage 1/4] Classify success. Set type='{resolved_ct}', agreement='{resolved_at}'.")
 
     # ── Phase 2: GROUNDING_RUNNING ───────────────────────────────────────────
     contract.workflow_state = "GROUNDING_RUNNING"
     await db.flush()
+    log_progress(contract_id, f"[Stage 2/4] Triggering Extraction Engine for {len(rule_payloads)} rules with CriticAgent feedback loops...")
 
     extracted_params = await extraction_engine.run_extraction_for_rules(
         document_text=contract.document_text,
@@ -761,10 +779,12 @@ async def _execute_extraction_pipeline(db: AsyncSession, contract_id: str, user_
         db=db,
         contract_id=contract_id,
     )
+    log_progress(contract_id, f"[Stage 2/4] Extraction and semantic grounding successful. Extracted {len(extracted_params)} items.")
 
     # ── Phase 3: VALIDATION_RUNNING ──────────────────────────────────────────
     contract.workflow_state = "VALIDATION_RUNNING"
     await db.flush()
+    log_progress(contract_id, "[Stage 3/4] Purging stale staging parameters and applying deterministic validation...")
 
     # Clear existing extracted parameters if any
     existing_params = await db.execute(
@@ -823,7 +843,10 @@ async def _execute_extraction_pipeline(db: AsyncSession, contract_id: str, user_
         p.validation_state = pd.get("validation_state", "needs_review")
         p.validation_message = pd.get("validation_message")
 
-    # Run RiskAgent
+    log_progress(contract_id, "[Stage 3/4] Critic and deterministic validation checks finished.")
+
+    # ── Phase 4: RISK ASSESSMENT ─────────────────────────────────────────────
+    log_progress(contract_id, "[Stage 4/4] Conducting multi-agent contract risk assessment...")
     risk_params = []
     for p in param_instances:
         risk_params.append({
@@ -837,6 +860,7 @@ async def _execute_extraction_pipeline(db: AsyncSession, contract_id: str, user_
     contract.risk_score = score
     contract.risk_level = level
     contract.risk_rationale = rationale
+    log_progress(contract_id, f"[Stage 4/4] Risk assessment complete. Calculated Score: {score} | Level: {level}")
 
     # Check for manual review / fallback
     any_manual_review = any(
@@ -850,12 +874,14 @@ async def _execute_extraction_pipeline(db: AsyncSession, contract_id: str, user_
             db, contract_id, "MANUAL_REVIEW_REQUIRED", "SYSTEM_VALIDATION",
             "workflow_state", "VALIDATION_RUNNING", "REVIEW_PENDING"
         )
+        log_progress(contract_id, "[Pipeline completed] Workspace draft successfully compiled. Attention required: manual review is pending.")
     else:
         contract.workflow_state = "DRAFT_READY"
         _write_audit(
             db, contract_id, "EXTRACTION_COMPLETE", "SYSTEM_EXTRACTION_ENGINE",
             "workflow_state", "VALIDATION_RUNNING", "DRAFT_READY"
         )
+        log_progress(contract_id, "[Pipeline completed] Workspace draft successfully compiled and validated. Ready for approval.")
 
     await db.flush()
 
@@ -920,8 +946,64 @@ async def get_suggested_tags(contract_id: str, db: AsyncSession = Depends(get_db
     return _serialize_tag_suggestions(s)
 
 
-@router.post("/{contract_id}/accept-tags", response_model=ContractResponse)
-async def accept_tags(contract_id: str, payload: TagSuggestionsAcceptRequest, db: AsyncSession = Depends(get_db)):
+from app.database import AsyncSessionLocal
+from fastapi.responses import StreamingResponse
+
+async def run_background_pipeline(contract_id: str, user_id: str):
+    async with AsyncSessionLocal() as db:
+        try:
+            await _execute_extraction_pipeline(db, contract_id, user_id)
+            await db.commit()
+        except Exception as e:
+            clm_logger.error(f"Error in background extraction pipeline for {contract_id}: {e}", exc_info=True)
+            await db.rollback()
+            try:
+                contract = await db.get(ContractMaster, contract_id)
+                if contract:
+                    contract.workflow_state = "FAILED"
+                    await db.commit()
+                log_progress(contract_id, f"[Pipeline failed] Extraction pipeline failed: {str(e)}")
+            except Exception as e2:
+                clm_logger.error(f"Failed to set status to FAILED: {e2}")
+
+
+@router.get("/{contract_id}/pipeline-stream")
+async def get_pipeline_stream(contract_id: str):
+    async def event_generator():
+        q = asyncio.Queue()
+        if contract_id not in _pipeline_queues:
+            _pipeline_queues[contract_id] = []
+        _pipeline_queues[contract_id].append(q)
+        
+        try:
+            history = _pipeline_logs.get(contract_id, [])
+            for msg in history:
+                yield f"data: {msg}\n\n"
+            
+            while True:
+                msg = await q.get()
+                yield f"data: {msg}\n\n"
+                if "Pipeline completed" in msg or "Pipeline failed" in msg:
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if contract_id in _pipeline_queues:
+                if q in _pipeline_queues[contract_id]:
+                    _pipeline_queues[contract_id].remove(q)
+                if not _pipeline_queues[contract_id]:
+                    del _pipeline_queues[contract_id]
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/{contract_id}/accept-tags", response_model=ContractResponse, status_code=status.HTTP_202_ACCEPTED)
+async def accept_tags(
+    contract_id: str,
+    payload: TagSuggestionsAcceptRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Accepts suggested upload-time tags and triggers the extraction/grounding/validation pipeline.
     """
@@ -936,25 +1018,33 @@ async def accept_tags(contract_id: str, payload: TagSuggestionsAcceptRequest, db
     if s is None:
         raise HTTPException(status_code=400, detail="No tag suggestions exist for this contract to accept.")
 
-    prev_state = contract.workflow_state
+    if contract_id in _pipeline_logs:
+        _pipeline_logs[contract_id] = []
+
     contract.contract_type = s.contract_type
     contract.business_unit = s.business_unit
     contract.jurisdiction = s.jurisdiction
+    contract.workflow_state = "EXTRACTION_RUNNING"
 
     _write_audit(
         db, contract_id, "TAG_SUGGESTIONS_ACCEPTED", payload.modified_by,
         "contract_type/business_unit", f"{contract.contract_type}/{contract.business_unit}"
     )
-
-    await _execute_extraction_pipeline(db, contract_id, payload.modified_by)
     await db.commit()
+
+    background_tasks.add_task(run_background_pipeline, contract_id, payload.modified_by)
 
     saved = await _load_contract(db, contract_id)
     return _serialize_contract(saved)
 
 
-@router.post("/{contract_id}/edit-tags", response_model=ContractResponse)
-async def edit_tags(contract_id: str, payload: TagSuggestionsEditRequest, db: AsyncSession = Depends(get_db)):
+@router.post("/{contract_id}/edit-tags", response_model=ContractResponse, status_code=status.HTTP_202_ACCEPTED)
+async def edit_tags(
+    contract_id: str,
+    payload: TagSuggestionsEditRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Accepts user-edited tags and triggers the extraction/grounding/validation pipeline.
     """
@@ -962,7 +1052,9 @@ async def edit_tags(contract_id: str, payload: TagSuggestionsEditRequest, db: As
     if not contract:
         raise HTTPException(status_code=404, detail="Contract not found")
 
-    prev_state = contract.workflow_state
+    if contract_id in _pipeline_logs:
+        _pipeline_logs[contract_id] = []
+
     if payload.contract_type:
         contract.contract_type = payload.contract_type
     if payload.business_unit:
@@ -970,13 +1062,15 @@ async def edit_tags(contract_id: str, payload: TagSuggestionsEditRequest, db: As
     if payload.jurisdiction:
         contract.jurisdiction = payload.jurisdiction
 
+    contract.workflow_state = "EXTRACTION_RUNNING"
+
     _write_audit(
         db, contract_id, "TAG_SUGGESTIONS_EDITED", payload.modified_by,
         "contract_type/business_unit", f"{contract.contract_type}/{contract.business_unit}"
     )
-
-    await _execute_extraction_pipeline(db, contract_id, payload.modified_by)
     await db.commit()
+
+    background_tasks.add_task(run_background_pipeline, contract_id, payload.modified_by)
 
     saved = await _load_contract(db, contract_id)
     return _serialize_contract(saved)
@@ -1340,28 +1434,25 @@ async def approve_contract(contract_id: str, payload: WorkflowActionRequest, db:
     if contract is None:
         raise HTTPException(status_code=404, detail="Contract not found")
 
-    prev = contract.workflow_state
-    contract.workflow_state = "APPROVED"
-    contract.approved_by = payload.modified_by
-    note = f"APPROVED | {payload.comment}" if payload.comment else "APPROVED"
-    _write_audit(db, contract_id, "APPROVE_CONTRACT", payload.modified_by, "workflow_state", prev, note)
-
-    # Promote to published tables before committing so both changes are atomic.
     try:
         await publishing_service.promote(
             db=db,
             contract_id=contract_id,
             approved_by=payload.modified_by,
         )
+        await db.commit()
     except Exception as exc:
-        clm_logger.warning(
-            f"[Approve] PublishingService.promote() failed for contract '{contract_id}': {exc}. "
-            "Approval state change will still be committed. Promotion is idempotent and can be retried.",
+        await db.rollback()
+        clm_logger.error(
+            f"[Approve] promote failed for contract '{contract_id}': {exc}",
             exc_info=True,
         )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Promotion failed: {str(exc)}"
+        )
 
-    await db.commit()
-    return {"status": "APPROVED"}
+    return {"status": "APPROVED", "message": "Contract promoted to published and staging workspace cleaned."}
 
 @router.post("/{contract_id}/send-back")
 async def send_back_contract(contract_id: str, payload: WorkflowActionRequest, db: AsyncSession = Depends(get_db)):

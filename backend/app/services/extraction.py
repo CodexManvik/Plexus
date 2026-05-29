@@ -390,7 +390,7 @@ def _citation_in_text(citation: str, corpus: str) -> bool:
     return False
 
 
-def _critic_node(state: ExtractionState) -> ExtractionState:
+async def _critic_node(state: ExtractionState) -> ExtractionState:
     """
     Validates the extractor's output. Checks:
       1. citation is present (exact OR whitespace-normalized) in at least one
@@ -400,94 +400,48 @@ def _critic_node(state: ExtractionState) -> ExtractionState:
     On FAIL: writes specific feedback and increments retry_count.
     On EXHAUSTED: sets circuit_broken=True.
     """
+    from app.services.agents.critic_agent import CriticAgent
+
     rule = state["rule"]
     param_name = (rule.get("parameter_name") or rule.get("parameter_head") or "UNKNOWN").strip()
     max_retries = settings.extraction_max_critic_retries
     citation = state.get("citation")
     value = state.get("value")
+    pre_fetched_chunks = state.get("pre_fetched_chunks") or []
+    full_text = state.get("document_text") or ""
+    parameter_logic = rule.get("parameter_logic") or ""
+    retry_count = state.get("retry_count", 0)
 
     clm_logger.info(
         f"[Extraction] Critic Node validating '{param_name}' "
-        f"(Value: '{value}', Citation: '{citation}', Attempt: {state.get('retry_count', 0) + 1}/{max_retries})"
+        f"(Value: '{value}', Citation: '{citation}', Attempt: {retry_count + 1}/{max_retries})"
     )
 
-    # Null extraction is a valid terminal state (parameter not found).
-    if not citation and not value:
+    critic = CriticAgent()
+    is_valid, feedback = await critic.validate_extraction(
+        parameter_name=param_name,
+        value=value,
+        citation=citation,
+        pre_fetched_chunks=pre_fetched_chunks,
+        full_text=full_text,
+        parameter_logic=parameter_logic,
+        retry_count=retry_count,
+    )
+
+    if is_valid:
         state["critic_feedback"] = None
-        clm_logger.info(f"[Extraction] Critic Node passed for '{param_name}': parameter not found (null extraction)")
-        return state
-
-    # Validate citation presence (exact or whitespace-normalized).
-    citation_verified = False
-    if citation:
-        chunk_hits = state.get("pre_fetched_chunks") or []
-        for chunk in chunk_hits:
-            if _citation_in_text(citation, chunk.get("chunk_text") or ""):
-                citation_verified = True
-                break
-        if not citation_verified:
-            # Fall back to full document_text (covers non-PDF or chunk-miss edge cases).
-            if _citation_in_text(citation, state["document_text"]):
-                citation_verified = True
-
-    if citation and not citation_verified:
-        retry_count = state.get("retry_count", 0) + 1
-        state["retry_count"] = retry_count
-        if retry_count > max_retries:
+        clm_logger.info(f"[Extraction] Critic Node validation PASSED for '{param_name}'")
+    else:
+        new_retry = retry_count + 1
+        state["retry_count"] = new_retry
+        state["critic_feedback"] = feedback
+        if new_retry > max_retries:
             state["circuit_broken"] = True
-            state["critic_feedback"] = (
-                f"CIRCUIT BREAKER: citation not found after {max_retries} retries "
-                f"(exact and whitespace-normalized). "
-                f"Attempted citation: {citation!r}"
-            )
-            clm_logger.error(f"[Extraction] Critic Node validation FAILED (citation not found, circuit breaker triggered) for '{param_name}'. Citation: {citation!r}")
+            state["critic_feedback"] = f"CIRCUIT BREAKER: {feedback}"
+            clm_logger.error(f"[Extraction] Critic Node validation FAILED (circuit breaker triggered) for '{param_name}'.")
         else:
-            state["critic_feedback"] = (
-                f"VALIDATION FAILURE (attempt {retry_count}/{max_retries}): "
-                f"The citation string was not found in the source document. "
-                f"You returned: {citation!r}. "
-                "Copy the exact text from the provided excerpts — do not paraphrase or modify."
-            )
-            clm_logger.warning(
-                f"[Extraction] Critic Node validation FAILED (citation not found) for '{param_name}'. "
-                f"Attempt {retry_count}/{max_retries}. Citation: {citation!r}"
-            )
-        return state
+            clm_logger.warning(f"[Extraction] Critic Node validation FAILED for '{param_name}'. Attempt {new_retry}/{max_retries}")
 
-    # Value plausibility check for financial and date fields
-    if value and citation_verified:
-        param_logic = (state["rule"].get("parameter_logic") or "").lower()
-        param_name_lower = (state["rule"].get("parameter_name") or "").lower()
-        is_date_field = any(kw in param_logic or kw in param_name_lower
-                            for kw in ["date", "effective", "term", "expiry", "renewal", "duration", "period"])
-        is_financial_field = any(kw in param_logic or kw in param_name_lower
-                                 for kw in ["payment", "amount", "rate", "price", "fee", "cost",
-                                            "charge", "invoice", "consideration", "salary", "compensation"])
-        if is_financial_field and not re.search(r'[\d,]+\.?\d*', value):
-            retry_count = state.get("retry_count", 0) + 1
-            state["retry_count"] = retry_count
-            if retry_count > settings.extraction_max_critic_retries:
-                state["circuit_broken"] = True
-                state["critic_feedback"] = (
-                    f"CIRCUIT BREAKER: financial field '{state['rule'].get('parameter_name')}' "
-                    f"extracted value '{value}' contains no numeric amount after {settings.extraction_max_critic_retries} retries."
-                )
-                clm_logger.error(f"[Extraction] Critic Node validation FAILED (financial format mismatch, circuit breaker triggered) for '{param_name}'. Value: '{value}'")
-            else:
-                state["critic_feedback"] = (
-                    f"VALIDATION FAILURE (attempt {retry_count}/{settings.extraction_max_critic_retries}): "
-                    f"'{state['rule'].get('parameter_name')}' is a financial field but '{value}' contains no "
-                    f"numeric amount. Extract the specific currency amount, rate, or percentage from the document."
-                )
-                clm_logger.warning(
-                    f"[Extraction] Critic Node validation FAILED (financial format mismatch) for '{param_name}'. "
-                    f"Attempt {retry_count}/{settings.extraction_max_critic_retries}. Value: '{value}'"
-                )
-            return state
-
-    # PASS
-    state["critic_feedback"] = None
-    clm_logger.info(f"[Extraction] Critic Node validation PASSED for '{param_name}'")
     return state
 
 
@@ -674,7 +628,7 @@ async def _run_section_group(
 
             # Node: critic + conditional loop
             while True:
-                state = _critic_node(state)
+                state = await _critic_node(state)
 
                 if state.get("circuit_broken"):
                     state = await _circuit_break_node(
@@ -727,7 +681,7 @@ async def _run_section_group(
                         # Re-run extraction with expanded context
                         state = await _extractor_node(state)
                         while True:
-                            state = _critic_node(state)
+                            state = await _critic_node(state)
                             if state.get("circuit_broken") or state.get("critic_feedback") is None:
                                 break
                             if state.get("retry_count", 0) > settings.extraction_max_critic_retries:

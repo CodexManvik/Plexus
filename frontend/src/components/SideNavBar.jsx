@@ -6,13 +6,12 @@ const SideNavBar = ({ isCollapsed, toggleCollapse }) => {
   const location = useLocation();
   
   const navItems = [
-    { icon: 'dashboard', label: 'Analytics', path: '/dashboard' },
-    { icon: 'description', label: 'Contracts', path: '/repository' },
-    { icon: 'psychology', label: 'Extraction', path: '/extraction' },
-    { icon: 'chat_bubble', label: 'Assistant', path: '/assistant' },
-    { icon: 'admin_panel_settings', label: 'Admin', path: '/master-maintenance' },
-    { icon: 'fact_check', label: 'Review', path: '/approvals' },
-    { icon: 'inventory_2', label: 'Archive', path: '/repository' }
+    { icon: 'dashboard', label: 'Dashboard', path: '/dashboard' },
+    { icon: 'upload_file', label: 'Upload Staging', path: '/upload' },
+    { icon: 'fact_check', label: 'Draft Review', path: '/verification' },
+    { icon: 'inventory_2', label: 'Published Repo', path: '/repository' },
+    { icon: 'forum', label: 'RAG Assistant', path: '/assistant' },
+    { icon: 'admin_panel_settings', label: 'Maintenance', path: '/master-maintenance' }
   ];
 
   const getLinkClass = (path) => {

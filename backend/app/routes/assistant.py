@@ -154,6 +154,7 @@ async def ask_assistant(payload: AssistantQueryRequest, db: AsyncSession = Depen
                     score=score,
                     parameter_head=hit.get("header_name"),
                     parameter_name=hit.get("param_name"),
+                    spatial_json=hit.get("spatial_json"),
                 )
             )
     else:
@@ -180,6 +181,7 @@ async def ask_assistant(payload: AssistantQueryRequest, db: AsyncSession = Depen
                     score=score,
                     parameter_head=hit.get("header_name"),
                     parameter_name=hit.get("param_name"),
+                    spatial_json=hit.get("spatial_json"),
                 )
             )
 
@@ -213,6 +215,7 @@ async def ask_assistant(payload: AssistantQueryRequest, db: AsyncSession = Depen
                             score=sc,
                             parameter_head=param.header_name,
                             parameter_name=param.param_name,
+                            spatial_json=param.spatial_json,
                         )
                     )
         else:

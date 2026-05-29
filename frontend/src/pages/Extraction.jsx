@@ -42,6 +42,46 @@ const Extraction = () => {
   // Expandable state for parameter versioning accordions
   const [expandedVersionId, setExpandedVersionId] = useState(null);
 
+  // Pipeline telemetry live streaming logs
+  const [pipelineLogs, setPipelineLogs] = useState([]);
+  const terminalEndRef = useRef(null);
+
+  useEffect(() => {
+    if (!contractId) return;
+    const runningStates = ['EXTRACTION_RUNNING', 'GROUNDING_RUNNING', 'VALIDATION_RUNNING', 'PARSING'];
+    if (runningStates.includes(workflowStatus)) {
+      const eventSource = new EventSource(`${import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'}/contracts/${contractId}/pipeline-stream`);
+      
+      eventSource.onmessage = (event) => {
+        const msg = event.data;
+        setPipelineLogs((prev) => {
+          if (prev.includes(msg)) return prev;
+          return [...prev, msg];
+        });
+        
+        if (terminalEndRef.current) {
+          terminalEndRef.current.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        if (msg.includes('Pipeline completed') || msg.includes('Pipeline failed')) {
+          eventSource.close();
+          setTimeout(() => {
+            refresh();
+          }, 1500);
+        }
+      };
+
+      eventSource.onerror = (err) => {
+        console.error('EventSource connection error:', err);
+        eventSource.close();
+      };
+
+      return () => {
+        eventSource.close();
+      };
+    }
+  }, [contractId, workflowStatus, refresh]);
+
   const canvasRef = useRef(null);
   const containerRef = useRef(null);
   const renderTaskRef = useRef(null);
@@ -348,6 +388,58 @@ const Extraction = () => {
     if (score >= 0.5) return 'bg-amber-100 text-amber-800 border-amber-200';
     return 'bg-rose-100 text-rose-800 border-rose-200';
   };
+
+  if (['EXTRACTION_RUNNING', 'GROUNDING_RUNNING', 'VALIDATION_RUNNING', 'PARSING'].includes(workflowStatus)) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[calc(100vh-6rem)] w-full max-w-4xl mx-auto p-md font-sans">
+        <div className="w-full bg-slate-950 border border-slate-800 rounded-3xl p-lg shadow-2xl space-y-md flex flex-col h-[550px] overflow-hidden">
+          {/* Terminal Header */}
+          <div className="flex items-center justify-between border-b border-slate-800 pb-sm shrink-0">
+            <div className="flex items-center gap-xs">
+              <span className="w-3 h-3 rounded-full bg-rose-500 inline-block"></span>
+              <span className="w-3 h-3 rounded-full bg-amber-500 inline-block"></span>
+              <span className="w-3 h-3 rounded-full bg-emerald-500 inline-block"></span>
+              <span className="text-xs text-slate-400 font-mono ml-sm">Plexus Engine Telemetry Stream — {contractId}</span>
+            </div>
+            <div className="flex items-center gap-xs text-[10px] text-slate-500 font-mono">
+              <span className="w-2 h-2 rounded-full bg-blue-500 animate-ping inline-block"></span>
+              <span>LIVE</span>
+            </div>
+          </div>
+          
+          {/* Terminal Output */}
+          <div className="flex-1 overflow-y-auto font-mono text-xs text-slate-300 space-y-xs custom-scrollbar pr-xs">
+            {pipelineLogs.map((log, idx) => {
+              let color = "text-slate-300";
+              if (log.includes("[Stage 1/4]")) color = "text-blue-400 font-bold";
+              else if (log.includes("[Stage 2/4]")) color = "text-purple-400 font-bold";
+              else if (log.includes("[Stage 3/4]")) color = "text-cyan-400 font-bold";
+              else if (log.includes("[Stage 4/4]")) color = "text-yellow-400 font-bold";
+              else if (log.includes("Pipeline completed")) color = "text-emerald-400 font-black";
+              else if (log.includes("Pipeline failed")) color = "text-rose-400 font-black";
+              
+              return (
+                <div key={idx} className={`${color} leading-relaxed`}>
+                  <span className="text-slate-600 mr-sm select-none">[{idx + 1}]</span>
+                  {log}
+                </div>
+              );
+            })}
+            {pipelineLogs.length === 0 && (
+              <div className="text-slate-500 italic animate-pulse">Initializing SSE pipeline telemetric links...</div>
+            )}
+            <div ref={terminalEndRef} />
+          </div>
+
+          {/* Terminal Footer */}
+          <div className="border-t border-slate-800 pt-sm shrink-0 flex justify-between items-center text-[10px] text-slate-500 font-mono">
+            <span>State: <span className="text-blue-400 font-semibold">{workflowStatus}</span></span>
+            <span>Task ID: {contractId}</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-md w-full min-h-screen p-md text-slate-900 bg-slate-50 font-sans">

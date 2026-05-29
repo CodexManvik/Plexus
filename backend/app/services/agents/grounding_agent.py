@@ -27,7 +27,7 @@ class GroundingAgent:
 
         # Fallback path: GGUF local model (or Cohere)
         system_prompt = (
-            "You are a legal document evidence validator. Your task is to verify if a given "
+            "You are a document evidence validator. Your task is to verify if a given "
             "citation matches the meaning of text in a provided document corpus, allowing for minor "
             "paraphrasing, legal jargon formatting, or OCR spelling issues.\n"
             "Return ONLY 'TRUE' if the citation matches the meaning of a clause in the corpus, "
@@ -116,3 +116,23 @@ class GroundingAgent:
                 return idx, idx + len(first)
 
         return 0, 0
+
+    async def verify_coordinate_grounding(self, citation: str, text_block: str, location: dict) -> bool:
+        """
+        Accepts coordinate scopes and verifies that the text block exact-matches or fuzzy-matches
+        the target source string.
+        """
+        if not citation or not text_block:
+            return False
+        
+        page = location.get("page_number")
+        bbox = location.get("bbox")
+        clm_logger.info(
+            f"[GroundingAgent] Verifying coordinate grounding on Page {page} (bbox: {bbox}) "
+            f"for citation: '{citation[:40]}...'"
+        )
+        
+        # Check exact or fuzzy match
+        is_match = await self.resolve_paraphrased_evidence(citation, text_block)
+        clm_logger.info(f"[GroundingAgent] Coordinate grounding match result: {is_match}")
+        return is_match
