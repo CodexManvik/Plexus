@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     cors_origins_raw: str = Field(default="*", validation_alias="CORS_ORIGINS")
     cors_origins: List[str] = Field(default_factory=lambda: ["*"])
 
-    # Oracle 23ai — required, no fallback
+    # Oracle 26ai — required, no fallback
     oracle_db_user: str = Field(..., validation_alias="ORACLE_DB_USER")
     oracle_db_password: str = Field(..., validation_alias="ORACLE_DB_PASSWORD")
     oracle_db_dsn: str = Field(..., validation_alias="ORACLE_DB_DSN")
@@ -45,9 +45,14 @@ class Settings(BaseSettings):
     cohere_model: str = Field(
         default="command-r-plus", validation_alias="COHERE_MODEL"
     )
-    cohere_extraction_model: str = Field(
-        default="command-r-plus", validation_alias="COHERE_EXTRACTION_MODEL"
+    # Groq Credentials
+    groq_api_key: str | None = Field(default=None, validation_alias="GROQ_API_KEY")
+    groq_model: str = Field(
+        default="llama-3.3-70b-specdec", validation_alias="GROQ_MODEL"
     )
+    local_model_path: str | None = Field(default=None, validation_alias="LOCAL_MODEL_PATH")
+    parser_version: str = Field(default="1.0.0", validation_alias="PARSER_VERSION")
+    chunking_version: str = Field(default="1.0.0", validation_alias="CHUNKING_VERSION")
     lock_lease_minutes: int = Field(default=15, validation_alias="LOCK_LEASE_MINUTES")
     dashboard_horizon_days: int = Field(default=30, validation_alias="DASHBOARD_HORIZON_DAYS")
 

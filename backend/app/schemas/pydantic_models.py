@@ -51,6 +51,14 @@ class ParameterResponse(BaseSchema):
     is_user_added: bool = False
     is_verified: bool = False
     verification_note: Optional[str] = None
+    validation_state: str = "needs_review"
+    validation_message: Optional[str] = None
+    embed_model_name: Optional[str] = None
+    embed_dimension: Optional[int] = None
+    embed_quant_type: Optional[str] = None
+    parser_version: Optional[str] = None
+    chunking_version: Optional[str] = None
+    embed_created_at: Optional[datetime] = None
     last_modified: Optional[datetime] = None
 
 
@@ -82,6 +90,10 @@ class ContractResponse(BaseSchema, MetadataFields):
     document_version: int
     created_by: Optional[str] = None
     approved_by: Optional[str] = None
+    risk_score: Optional[float] = None
+    risk_level: Optional[str] = None
+    risk_rationale: Optional[str] = None
+    draft_checkpoint: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     last_updated: Optional[datetime] = None
@@ -115,6 +127,14 @@ class AssistantQueryRequest(BaseModel):
     question: str = Field(min_length=1, max_length=2000)
     contract_ids: List[str] = Field(default_factory=list)
     top_k: int = Field(default=3, ge=1, le=5)
+    draft_mode: bool = Field(
+        default=False,
+        description=(
+            "When False (default), the assistant queries published (approved) data only. "
+            "When True, queries draft tables instead \u2014 intended for development and debugging. "
+            "Using draft_mode=True in production will emit a warning."
+        ),
+    )
 
 
 class AssistantQueryResponse(BaseModel):
@@ -202,6 +222,7 @@ class DashboardAnalyticsResponse(BaseModel):
     backlog: List[BacklogDepartmentItem]
     expiries: List[ExpiryContractItem]
     activity: List[ActivityLogItem]
+    pending_rule_count: int = 0
 
 
 class ExtractionStatusResponse(BaseModel):
@@ -287,4 +308,50 @@ class SemanticSearchResponse(BaseModel):
     data: List[SemanticSearchResult]
     total: int
     query: str
+
+
+class TagSuggestionEntry(BaseModel):
+    value: str
+    confidence: float
+    rationale: str
+
+
+class ContractTagSuggestionResponse(BaseModel):
+    suggestion_id: int
+    contract_id: str
+    contract_type: TagSuggestionEntry
+    business_unit: TagSuggestionEntry
+    risk_level: TagSuggestionEntry
+    jurisdiction: TagSuggestionEntry
+    workflow_route: TagSuggestionEntry
+    extraction_template: TagSuggestionEntry
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TagSuggestionsAcceptRequest(BaseModel):
+    modified_by: str
+
+
+class TagSuggestionsEditRequest(BaseModel):
+    modified_by: str
+    contract_type: Optional[str] = None
+    business_unit: Optional[str] = None
+    risk_level: Optional[str] = None
+    jurisdiction: Optional[str] = None
+    workflow_route: Optional[str] = None
+    extraction_template: Optional[str] = None
+
+
+class DraftPauseRequest(BaseModel):
+    modified_by: str
+    checkpoint_json: str
+
+
+class DraftPauseResponse(BaseModel):
+    contract_id: str
+    workflow_state: str
+    draft_checkpoint: Optional[str] = None
+
 

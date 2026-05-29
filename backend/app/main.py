@@ -16,20 +16,35 @@ from app.config import settings
 from app.database import AsyncSessionLocal, Base, engine, get_database_driver
 from app.routes import assistant, contracts, dashboard, maintenance, metadata, rules, verification
 from app.services.bootstrap import seed_defaults
-from app.services.llm import azure_llm
+from app.services.llm import cohere_llm
 from app.services.logger import clm_logger
 
 
-# ── Tables the ORM owns — all must exist for the schema to be considered valid ─
+# ── Table classification ───────────────────────────────────────────────────────────────
+#
+# _CORE_TABLES: absence of any of these triggers a full drop-and-rebuild.
+# _PUBLISHED_TABLES: absence of any of these triggers additive-only CREATE TABLE
+#                    without dropping core tables. Published tables are a separate
+#                    trust zone and must never force destruction of draft data.
 
-_EXPECTED_TABLES: frozenset[str] = frozenset({
+_CORE_TABLES: frozenset[str] = frozenset({
     "contracts_master",
     "contract_parameters_extracted",
     "contract_document_chunks",
     "contract_audit_trail",
     "master_extraction_rules",
     "metadata_options",
+    "contract_tag_suggestions",
 })
+
+_PUBLISHED_TABLES: frozenset[str] = frozenset({
+    "published_contracts",
+    "published_parameters",
+    "published_chunks",
+})
+
+# Union of all expected tables (for backwards-compatible references).
+_EXPECTED_TABLES: frozenset[str] = _CORE_TABLES | _PUBLISHED_TABLES
 
 # VECTOR column dimension requirements. If any actual dim doesn't match the
 # configured EMBEDDING_VECTOR_DIM, the whole schema is rebuilt.
@@ -43,6 +58,12 @@ _VECTOR_COLUMN_DIMS: dict[str, dict[str, int]] = {
     "contract_document_chunks": {
         "chunk_vector": settings.embedding_vector_dim,
     },
+    "published_parameters": {
+        "vector_embed": settings.embedding_vector_dim,
+    },
+    "published_chunks": {
+        "chunk_vector": settings.embedding_vector_dim,
+    },
 }
 
 # Identity columns — their absence means the schema was created without Oracle
@@ -53,11 +74,15 @@ _IDENTITY_COLUMNS: dict[str, set[str]] = {
     "master_extraction_rules": {"rule_id"},
     "metadata_options": {"option_id"},
     "contract_document_chunks": {"chunk_id"},
+    "published_contracts": {"published_id"},
+    "published_parameters": {"published_param_id"},
+    "published_chunks": {"published_chunk_id"},
+    "contract_tag_suggestions": {"suggestion_id"},
 }
 
 # Oracle VECTOR index DDL — each wrapped in anonymous PL/SQL so the block
 # silently ignores ORA-00955 (object already exists) on restart.
-# INMEMORY NEIGHBOR GRAPH is the Oracle 23ai HNSW index type (zero training
+# INMEMORY NEIGHBOR GRAPH is the Oracle 26ai HNSW index type (zero training
 # data requirement, suitable for small-to-medium datasets).
 _VECTOR_INDEX_DDL: list[tuple[str, str]] = [
     (
@@ -90,6 +115,26 @@ _VECTOR_INDEX_DDL: list[tuple[str, str]] = [
         WITH TARGET ACCURACY 95
         """,
     ),
+    (
+        "idx_pub_param_vector",
+        """
+        CREATE VECTOR INDEX idx_pub_param_vector
+        ON published_parameters(vector_embed)
+        ORGANIZATION INMEMORY NEIGHBOR GRAPH
+        DISTANCE COSINE
+        WITH TARGET ACCURACY 95
+        """,
+    ),
+    (
+        "idx_pub_chunk_vector",
+        """
+        CREATE VECTOR INDEX idx_pub_chunk_vector
+        ON published_chunks(chunk_vector)
+        ORGANIZATION INMEMORY NEIGHBOR GRAPH
+        DISTANCE COSINE
+        WITH TARGET ACCURACY 95
+        """,
+    ),
 ]
 
 
@@ -97,16 +142,20 @@ _VECTOR_INDEX_DDL: list[tuple[str, str]] = [
 
 def _ensure_schema(sync_conn) -> None:
     """
-    Inspects the live Oracle schema and drops all ORM-owned tables if ANY of the
-    following conditions are true:
+    Inspects the live Oracle schema and applies one of two strategies:
 
-      1. A table from _EXPECTED_TABLES is missing entirely.
-      2. A VECTOR column has the wrong number of dimensions (EMBEDDING_VECTOR_DIM mismatch).
-      3. An Identity column is missing (schema created by a non-Oracle migration).
+    STRATEGY A — Additive migration (published tables only are missing):
+      If the only missing tables are a subset of _PUBLISHED_TABLES AND
+      contracts_master already exists, we call create_all with a filtered
+      table list. Existing draft data is preserved entirely.
 
-    After this function returns, the caller must invoke Base.metadata.create_all
-    to recreate all tables from ORM definitions. For non-Oracle dialects (e.g.,
-    SQLite in dev), this function is a no-op — SQLAlchemy handles those natively.
+    STRATEGY B — Full rebuild (core draft table missing):
+      If ANY table from _CORE_TABLES is missing, OR if a VECTOR column has
+      the wrong dimension, OR if an Identity column is absent, drop all ORM
+      tables and let create_all rebuild from scratch.
+
+    For non-Oracle dialects (e.g., SQLite in dev), this function is a no-op —
+    SQLAlchemy handles those natively.
     """
     if sync_conn.dialect.name != "oracle":
         return
@@ -114,17 +163,39 @@ def _ensure_schema(sync_conn) -> None:
     inspector = inspect(sync_conn)
     existing_tables: set[str] = set(inspector.get_table_names())
 
-    # ── Check 1: missing tables ───────────────────────────────────────────────
-    missing = _EXPECTED_TABLES - existing_tables
-    if missing:
+    # ── Classify missing tables ─────────────────────────────────────────────────
+    missing_core = _CORE_TABLES - existing_tables
+    missing_published = _PUBLISHED_TABLES - existing_tables
+
+    # ── STRATEGY A: published-only tables are missing, core is intact ─────────
+    if not missing_core and missing_published:
+        clm_logger.info(
+            f"[Schema] Core tables intact. Missing published tables only: "
+            f"{sorted(missing_published)}. Applying additive migration."
+        )
+        # Filter ORM metadata to only the missing published tables.
+        published_orm_tables = [
+            Base.metadata.tables[t]
+            for t in missing_published
+            if t in Base.metadata.tables
+        ]
+        if published_orm_tables:
+            Base.metadata.create_all(sync_conn, tables=published_orm_tables)
+            clm_logger.info(
+                f"[Schema] Additive migration complete: created {sorted(missing_published)}."
+            )
+        return
+
+    # ── STRATEGY B: core table missing — trigger full rebuild ────────────────
+    if missing_core:
         clm_logger.warning(
-            f"[Schema] Missing tables detected: {sorted(missing)}. "
-            "Dropping all and recreating from ORM metadata."
+            f"[Schema] Missing CORE tables detected: {sorted(missing_core)}. "
+            "Dropping all ORM tables and recreating from metadata."
         )
         Base.metadata.drop_all(sync_conn)
-        return  # create_all will run immediately after
+        return  # create_all will run immediately after in the lifespan caller
 
-    # ── Check 2: VECTOR dimension mismatch ───────────────────────────────────
+    # ── Check: VECTOR dimension mismatch ──────────────────────────────────
     for table_name, columns in _VECTOR_COLUMN_DIMS.items():
         if table_name not in existing_tables:
             continue
@@ -145,7 +216,7 @@ def _ensure_schema(sync_conn) -> None:
                 Base.metadata.drop_all(sync_conn)
                 return
 
-    # ── Check 3: missing Identity columns ────────────────────────────────────
+    # ── Check: missing Identity columns ────────────────────────────────────
     for table_name, identity_cols in _IDENTITY_COLUMNS.items():
         if table_name not in existing_tables:
             continue
@@ -169,7 +240,7 @@ def _ensure_schema(sync_conn) -> None:
 
 async def _ensure_vector_indexes(conn) -> None:
     """
-    Creates Oracle 23ai VECTOR indexes if they do not already exist.
+    Creates Oracle 26ai VECTOR indexes if they do not already exist.
     Each DDL statement is wrapped in an anonymous PL/SQL block that silently
     swallows ORA-00955 (name already used by an existing object), making this
     safe to call on every restart.
@@ -198,7 +269,7 @@ async def _ensure_vector_indexes(conn) -> None:
             # to full table scans without them. Log and continue.
             clm_logger.warning(
                 f"[Schema] Could not create VECTOR index '{index_name}': {exc}. "
-                "Queries will use full scans. This is expected on non-23ai Oracle instances."
+                "Queries will use full scans. This is expected on non-26ai Oracle instances."
             )
 
 
@@ -226,7 +297,7 @@ async def lifespan(_: FastAPI):
             await conn.run_sync(Base.metadata.create_all)
             clm_logger.info("[Startup] ORM tables created/verified.")
 
-            # Step 3: VECTOR indexes (Oracle 23ai only, idempotent).
+            # Step 3: VECTOR indexes (Oracle 26ai only, idempotent).
             await _ensure_vector_indexes(conn)
 
         # Step 4: Seed default rules and metadata (runs in its own session).
@@ -239,7 +310,7 @@ async def lifespan(_: FastAPI):
         yield
 
     finally:
-        await azure_llm.aclose()
+        await cohere_llm.aclose()
         clm_logger.info("[Shutdown] LLM client closed.")
 
 

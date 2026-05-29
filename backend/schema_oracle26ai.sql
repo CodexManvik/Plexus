@@ -1,14 +1,16 @@
 -- =============================================================================
--- ContractLens CLM — Oracle 23ai Schema
+-- ContractLens CLM — Oracle 26ai Schema
 -- Changes from v1:
 --   • contracts_master.document_blob      BLOB     — stores raw uploaded file
---   • contracts_master.document_vector    VECTOR(1024, FLOAT32) — doc embedding
---   • contract_parameters_extracted.vector_embed VECTOR(1024, FLOAT32)
+--   • contracts_master.document_vector    VECTOR(1024, INT8) — doc embedding
+--   • contract_parameters_extracted.vector_embed VECTOR(1024, INT8)
 --   • VECTOR indexes using IVF for fast ANN search
 --   • SQLite fallback removed
 -- =============================================================================
 
 -- Cleanup (safe drop order: dependents first)
+BEGIN EXECUTE IMMEDIATE 'DROP TABLE contract_tag_suggestions CASCADE CONSTRAINTS'; EXCEPTION WHEN OTHERS THEN NULL; END;
+/
 BEGIN EXECUTE IMMEDIATE 'DROP VIEW contract_validation_dv'; EXCEPTION WHEN OTHERS THEN NULL; END;
 /
 BEGIN EXECUTE IMMEDIATE 'DROP TABLE contract_audit_trail CASCADE CONSTRAINTS'; EXCEPTION WHEN OTHERS THEN NULL; END;
@@ -66,7 +68,7 @@ CREATE TABLE contracts_master (
 
     -- 1024-dim GGUF embedding of document text
     -- Used for document-level semantic search
-    document_vector                      VECTOR(1024, FLOAT32),
+    document_vector                      VECTOR(1024, INT8),
 
     workflow_state                       VARCHAR2(30) DEFAULT 'STAGED_DRAFT' NOT NULL,
     checked_out_by                       VARCHAR2(100),
@@ -74,6 +76,10 @@ CREATE TABLE contracts_master (
     document_version                     NUMBER DEFAULT 1 NOT NULL,
     created_by                           VARCHAR2(100),
     approved_by                          VARCHAR2(100),
+    risk_score                           NUMBER(5,2),
+    risk_level                           VARCHAR2(30),
+    risk_rationale                       CLOB,
+    draft_checkpoint                     CLOB,
     created_at                           TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     updated_at                           TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
     last_updated                         TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
@@ -138,12 +144,20 @@ CREATE TABLE contract_parameters_extracted (
     spatial_json       JSON,
 
     -- 1024-dim embedding of citation_text — for VECTOR_DISTANCE RAG search
-    vector_embed       VECTOR(1024, FLOAT32),
+    vector_embed       VECTOR(1024, INT8),
 
     source_query       VARCHAR2(250),
     is_user_added      NUMBER(1) DEFAULT 0 NOT NULL,
     is_verified        NUMBER(1) DEFAULT 0 NOT NULL,
     verification_note  CLOB,
+    validation_state   VARCHAR2(30) DEFAULT 'needs_review' NOT NULL,
+    validation_message CLOB,
+    embed_model_name   VARCHAR2(100),
+    embed_dimension    NUMBER,
+    embed_quant_type   VARCHAR2(30),
+    parser_version     VARCHAR2(50),
+    chunking_version   VARCHAR2(50),
+    embed_created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_modified      TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 
@@ -178,13 +192,19 @@ CREATE TABLE contract_document_chunks (
     -- Array of per-line bounding boxes: [[page,x0,y0,x1,y1,pw,ph],...]
     spatial_json JSON,
     -- Paragraph-level embedding for granular cosine search
-    chunk_vector VECTOR(1024, FLOAT32),
+    chunk_vector VECTOR(1024, INT8),
+    embed_model_name   VARCHAR2(100),
+    embed_dimension    NUMBER,
+    embed_quant_type   VARCHAR2(30),
+    parser_version     VARCHAR2(50),
+    chunking_version   VARCHAR2(50),
+    embed_created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_chunk_contract_idx UNIQUE (contract_id, chunk_index)
 );
 
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- Vector indexes (Oracle 23ai IVF — approximate nearest-neighbour)
+-- Vector indexes (Oracle 26ai IVF — approximate nearest-neighbour)
 -- Run AFTER inserting a reasonable number of rows (IVF needs training data).
 -- ─────────────────────────────────────────────────────────────────────────────
 
@@ -264,3 +284,144 @@ SELECT JSON {
     ]
 }
 FROM contracts_master c WITH INSERT UPDATE DELETE;
+
+
+-- =============================================================================
+-- Published Tables (approved / trusted corpus)
+-- =============================================================================
+-- MIGRATION NOTE: For existing deployments, run ONLY this section.
+-- Do NOT re-run the DROP statements at the top of this file.
+-- The _ensure_schema surgical mode will also create these automatically on startup.
+-- =============================================================================
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- published_contracts
+-- One row per approved contract publication event.
+-- contract_id is NOT a FK to contracts_master by design (no CASCADE DELETE).
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE published_contracts (
+    published_id          NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    contract_id           VARCHAR2(50) NOT NULL,
+    contract_type         VARCHAR2(100) NOT NULL,
+    agreement_type        VARCHAR2(100) NOT NULL,
+    organization          VARCHAR2(100) NOT NULL,
+    business_unit         VARCHAR2(100) NOT NULL,
+    customer_partner_name VARCHAR2(200),
+    effective_date        DATE,
+    approved_by           VARCHAR2(100) NOT NULL,
+    approved_at           TIMESTAMP WITH TIME ZONE,
+    risk_score            NUMBER(5,2),
+    risk_level            VARCHAR2(30),
+    risk_rationale        CLOB,
+    published_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+CREATE INDEX idx_pub_contract_id ON published_contracts(contract_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- published_parameters
+-- Approved parameter values promoted from contract_parameters_extracted.
+-- effective_value = user_override if set, else original_extract (resolved at
+-- promotion time — self-contained, no joins needed for retrieval).
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE published_parameters (
+    published_param_id   NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    published_id         NUMBER NOT NULL
+                             REFERENCES published_contracts(published_id) ON DELETE CASCADE,
+    contract_id          VARCHAR2(50) NOT NULL,
+    header_name          VARCHAR2(150) NOT NULL,
+    param_name           VARCHAR2(150) NOT NULL,
+    effective_value      CLOB,
+    citation_text        CLOB,
+    citation_start       NUMBER,
+    citation_end         NUMBER,
+    spatial_json         JSON,
+    vector_embed         VECTOR(1024, INT8),
+    source_query         VARCHAR2(250),
+    validation_state     VARCHAR2(30) DEFAULT 'needs_review' NOT NULL,
+    validation_message   CLOB,
+    embed_model_name     VARCHAR2(100),
+    embed_dimension      NUMBER,
+    embed_quant_type     VARCHAR2(30),
+    parser_version       VARCHAR2(50),
+    chunking_version     VARCHAR2(50),
+    embed_created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_pub_param_published_id ON published_parameters(published_id);
+CREATE INDEX idx_pub_param_contract_id  ON published_parameters(contract_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- published_chunks
+-- Approved document chunks promoted from contract_document_chunks.
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE published_chunks (
+    published_chunk_id   NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    published_id         NUMBER NOT NULL
+                             REFERENCES published_contracts(published_id) ON DELETE CASCADE,
+    contract_id          VARCHAR2(50) NOT NULL,
+    chunk_index          NUMBER(6) NOT NULL,
+    chunk_text           CLOB NOT NULL,
+    char_start           NUMBER(10) NOT NULL,
+    char_end             NUMBER(10) NOT NULL,
+    spatial_json         JSON,
+    chunk_vector         VECTOR(1024, INT8),
+    embed_model_name     VARCHAR2(100),
+    embed_dimension      NUMBER,
+    embed_quant_type     VARCHAR2(30),
+    parser_version       VARCHAR2(50),
+    chunking_version     VARCHAR2(50),
+    embed_created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_pub_chunk_published_id ON published_chunks(published_id);
+CREATE INDEX idx_pub_chunk_contract_id  ON published_chunks(contract_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Vector indexes on published tables
+-- Run AFTER inserting a reasonable number of rows (IVF needs training data).
+-- These mirror the draft-table vector indexes for consistent ANN search quality.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE VECTOR INDEX idx_pub_param_vector
+ON published_parameters(vector_embed)
+ORGANIZATION INMEMORY NEIGHBOR GRAPH
+DISTANCE COSINE
+WITH TARGET ACCURACY 95;
+
+CREATE VECTOR INDEX idx_pub_chunk_vector
+ON published_chunks(chunk_vector)
+ORGANIZATION INMEMORY NEIGHBOR GRAPH
+DISTANCE COSINE
+WITH TARGET ACCURACY 95;
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- contract_tag_suggestions
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE contract_tag_suggestions (
+    suggestion_id             NUMBER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    contract_id               VARCHAR2(50) NOT NULL
+                                  REFERENCES contracts_master(contract_id) ON DELETE CASCADE,
+    contract_type             VARCHAR2(100),
+    contract_type_confidence  NUMBER(4,3),
+    contract_type_rationale   CLOB,
+    business_unit             VARCHAR2(100),
+    business_unit_confidence  NUMBER(4,3),
+    business_unit_rationale   CLOB,
+    risk_level                VARCHAR2(30),
+    risk_level_confidence     NUMBER(4,3),
+    risk_level_rationale      CLOB,
+    jurisdiction              VARCHAR2(100),
+    jurisdiction_confidence   NUMBER(4,3),
+    jurisdiction_rationale    CLOB,
+    workflow_route            VARCHAR2(150),
+    workflow_route_confidence  NUMBER(4,3),
+    workflow_route_rationale   CLOB,
+    extraction_template       VARCHAR2(150),
+    extraction_template_confidence NUMBER(4,3),
+    extraction_template_rationale  CLOB,
+    created_at                TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+
+CREATE INDEX idx_tag_suggest_contract ON contract_tag_suggestions(contract_id);

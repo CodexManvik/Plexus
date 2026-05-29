@@ -36,6 +36,7 @@ from app.models.orm import (
     ContractParameterExtracted,
     MasterExtractionRule,
     MetadataOption,
+    ContractTagSuggestion,
 )
 from app.schemas.pydantic_models import (
     AuditTrailResponse,
@@ -53,14 +54,26 @@ from app.schemas.pydantic_models import (
     WorkflowActionRequest,
     SemanticSearchResult,
     SemanticSearchResponse,
+    ContractTagSuggestionResponse,
+    TagSuggestionsAcceptRequest,
+    TagSuggestionsEditRequest,
+    DraftPauseRequest,
+    DraftPauseResponse,
 )
 from app.services.document_parser import CoordIndex, extract_document_text
 from app.services.extraction import extraction_engine
 from app.services import embeddings as emb
 from app.services.embeddings import embed_batch
 from app.services.logger import clm_logger
+from app.services.publishing import publishing_service
+from app.services.agents import TaggingAgent, GroundingAgent, CriticAgent, RiskAgent
+from app.services.validation import ValidationService
 
 router = APIRouter(prefix="/contracts", tags=["Contracts Workflow"])
+
+tagging_agent = TaggingAgent()
+risk_agent = RiskAgent()
+validation_service = ValidationService()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -140,7 +153,7 @@ async def _build_and_store_chunks(
         # Dim guard: discard mismatched vectors to prevent Oracle type errors.
         if vec is not None and len(vec) == settings.embedding_vector_dim:
             valid_vectors.append(vec)
-            store_vec: Optional[List[float]] = vec
+            store_vec = emb.quantize_to_int8(vec)
         else:
             store_vec = None
 
@@ -153,6 +166,11 @@ async def _build_and_store_chunks(
                 char_end=record["char_end"],
                 spatial_json=record["spatial_json"],
                 chunk_vector=store_vec,
+                embed_model_name=settings.sentence_transformer_model,
+                embed_dimension=settings.embedding_vector_dim,
+                embed_quant_type="INT8",
+                parser_version=settings.parser_version,
+                chunking_version=settings.chunking_version,
             ))
 
     if not valid_vectors:
@@ -190,7 +208,7 @@ async def _classify_and_inject_rules(
 
     Returns: (resolved_contract_type, resolved_agreement_type, transient_rule_payloads)
     """
-    from app.services.llm import azure_llm
+    from app.services.llm import cohere_llm
     import json as _json
 
     clm_logger.info(
@@ -222,7 +240,7 @@ async def _classify_and_inject_rules(
     transient_rules: List[Dict[str, Any]] = []
 
     try:
-        raw = await azure_llm.get_chat_completion(
+        raw = await cohere_llm.get_chat_completion(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             response_format=None,
@@ -258,6 +276,7 @@ async def _classify_and_inject_rules(
     )
 
     # ── Stage generated rules in master_extraction_rules ─────────────────────
+    staged_count = 0
     for rule_def in raw_rules:
         if not isinstance(rule_def, dict):
             continue
@@ -296,8 +315,30 @@ async def _classify_and_inject_rules(
             is_active=False,         # Staged — requires admin activation.
             created_by="SYSTEM_AI_PROPOSAL",
         ))
+        staged_count += 1
 
     await db.flush()  # Assign PKs without committing the parent transaction.
+
+    # Write AI_RULES_STAGED audit event if any new rules were staged.
+    if staged_count > 0:
+        import json as _audit_json
+        db.add(ContractAuditTrail(
+            contract_id=contract_id,
+            action_type="AI_RULES_STAGED",
+            field_changed="master_extraction_rules",
+            old_value_clob=None,
+            new_value_clob=_audit_json.dumps({
+                "staged_count": staged_count,
+                "contract_type": resolved_ct,
+                "agreement_type": resolved_at,
+            }),
+            modified_by="SYSTEM_AI_PROPOSAL",
+        ))
+        clm_logger.info(
+            f"[Classification] AI_RULES_STAGED audit written for contract '{contract_id}': "
+            f"{staged_count} rules staged for contract_type='{resolved_ct}', "
+            f"agreement_type='{resolved_at}'."
+        )
 
     return resolved_ct, resolved_at, transient_rules
 
@@ -337,6 +378,14 @@ def _serialize_parameter(param: ContractParameterExtracted) -> ParameterResponse
         is_user_added=param.is_user_added,
         is_verified=param.is_verified,
         verification_note=param.verification_note,
+        validation_state=param.validation_state,
+        validation_message=param.validation_message,
+        embed_model_name=param.embed_model_name,
+        embed_dimension=param.embed_dimension,
+        embed_quant_type=param.embed_quant_type,
+        parser_version=param.parser_version,
+        chunking_version=param.chunking_version,
+        embed_created_at=param.embed_created_at,
         last_modified=param.last_modified,
     )
 
@@ -375,6 +424,10 @@ def _serialize_contract(contract: ContractMaster, include_document_text: bool = 
         document_version=contract.document_version,
         created_by=contract.created_by,
         approved_by=contract.approved_by,
+        risk_score=_to_float(contract.risk_score),
+        risk_level=contract.risk_level,
+        risk_rationale=contract.risk_rationale,
+        draft_checkpoint=contract.draft_checkpoint,
         created_at=contract.created_at,
         updated_at=contract.updated_at,
         last_updated=contract.last_updated,
@@ -388,6 +441,7 @@ async def _load_contract(db: AsyncSession, contract_id: str) -> Optional[Contrac
         select(ContractMaster)
         .options(selectinload(ContractMaster.parameters))
         .where(ContractMaster.contract_id == contract_id)
+        .execution_options(populate_existing=True)
     )
     return result.scalars().first()
 
@@ -540,19 +594,9 @@ async def upload_contract(
     file_bytes = await file.read()
     content_type = file.content_type or ""
 
-    # ── Phase 1: Layout-aware parsing → (text, coord_index) ──────────────────
-    document_text, coord_index = extract_document_text(
-        file.filename or "uploaded_document", content_type, file_bytes
-    )
-    if not document_text:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Could not extract readable text from the uploaded document.",
-        )
-
     contract_id = f"CON-{uuid.uuid4().hex[:10].upper()}"
 
-    # ── Phase 2: Persist contract master row (doc_vector set after chunking) ──
+    # ── Phase 1: UPLOADED state ──────────────────────────────────────────────
     contract = ContractMaster(
         contract_id=contract_id,
         organization=organization,
@@ -581,12 +625,41 @@ async def upload_contract(
         uploaded_filename=file.filename,
         uploaded_content_type=content_type,
         document_blob=file_bytes,
-        document_text=document_text,
-        document_vector=None,       # Populated below after mean-pool computation.
-        workflow_state="STAGED_DRAFT",
+        document_text="",
+        document_vector=None,
+        workflow_state="UPLOADED",
         created_by=user_id,
     )
     db.add(contract)
+    await db.flush()
+
+    _write_audit(db, contract_id, "UPLOAD", user_id, "workflow_state", None, "UPLOADED")
+
+    # ── Phase 2: PARSING state ───────────────────────────────────────────────
+    contract.workflow_state = "PARSING"
+    await db.flush()
+
+    document_text, coord_index = extract_document_text(
+        file.filename or "uploaded_document", content_type, file_bytes
+    )
+    if not document_text:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Could not extract readable text from the uploaded document.",
+        )
+
+    contract.document_text = document_text
+    await db.flush()
+
+    # Build paragraph chunks + mean-pool document_vector
+    mean_pool_vector = await _build_and_store_chunks(
+        db=db,
+        contract_id=contract_id,
+        document_text=document_text,
+        coord_index=coord_index,
+    )
+    contract.document_vector = emb.quantize_to_int8(mean_pool_vector)
+    await db.flush()
 
     for cat, val in [
         ("organization", organization),
@@ -601,84 +674,39 @@ async def upload_contract(
     ]:
         await _upsert_metadata_option(db, cat, val)
 
-    await db.flush()  # Assign PK before chunk FK references.
-
-    # ── Phase 2: Build paragraph chunks + mean-pool document_vector ──────────
-    mean_pool_vector = await _build_and_store_chunks(
-        db=db,
-        contract_id=contract_id,
-        document_text=document_text,
-        coord_index=coord_index,
-    )
-    contract.document_vector = mean_pool_vector
     await db.flush()
 
-    # ── Phase 4: Rule resolution + optional auto-classification ──────────────
-    active_rules = await _load_active_rules(db, contract_type, agreement_type)
-    rule_payloads: List[Dict[str, Any]]
-    auto_classified = False
+    # ── Phase 3: TAG_SUGGESTION_READY state ──────────────────────────────────
+    suggestions = await tagging_agent.suggest_tags(document_text, file.filename)
+    
+    # Save suggestions
+    db.add(ContractTagSuggestion(
+        contract_id=contract_id,
+        contract_type=suggestions["contract_type"]["value"],
+        contract_type_confidence=suggestions["contract_type"]["confidence"],
+        contract_type_rationale=suggestions["contract_type"]["rationale"],
+        business_unit=suggestions["business_unit"]["value"],
+        business_unit_confidence=suggestions["business_unit"]["confidence"],
+        business_unit_rationale=suggestions["business_unit"]["rationale"],
+        risk_level=suggestions["risk_level"]["value"],
+        risk_level_confidence=suggestions["risk_level"]["confidence"],
+        risk_level_rationale=suggestions["risk_level"]["rationale"],
+        jurisdiction=suggestions["jurisdiction"]["value"],
+        jurisdiction_confidence=suggestions["jurisdiction"]["confidence"],
+        jurisdiction_rationale=suggestions["jurisdiction"]["rationale"],
+        workflow_route=suggestions["workflow_route"]["value"],
+        workflow_route_confidence=suggestions["workflow_route"]["confidence"],
+        workflow_route_rationale=suggestions["workflow_route"]["rationale"],
+        extraction_template=suggestions["extraction_template"]["value"],
+        extraction_template_confidence=suggestions["extraction_template"]["confidence"],
+        extraction_template_rationale=suggestions["extraction_template"]["rationale"],
+    ))
 
-    if not active_rules:
-        resolved_ct, resolved_at, rule_payloads = await _classify_and_inject_rules(
-            document_text=document_text,
-            submitted_contract_type=contract_type,
-            submitted_agreement_type=agreement_type,
-            db=db,
-            contract_id=contract_id,
-        )
-        # Update contract with corrected classification if LLM changed it.
-        contract.contract_type = resolved_ct
-        contract.agreement_type = resolved_at
-        auto_classified = True
-        _write_audit(
-            db, contract_id, "LLM_CLASSIFIED", "SYSTEM_AI",
-            "contract_type/agreement_type",
-            f"{contract_type}/{agreement_type}",
-            f"{resolved_ct}/{resolved_at}",
-        )
-    else:
-        rule_payloads = [_build_rule_payload(r) for r in active_rules]
-
-    # ── Phase 3: LangGraph agentic extraction ─────────────────────────────────
-    any_manual_review = False
-    if rule_payloads:
-        extracted_params = await extraction_engine.run_extraction_for_rules(
-            document_text=document_text,
-            rules=rule_payloads,
-            file_bytes=file_bytes,
-            content_type=content_type,
-            coord_index=coord_index,
-            db=db,
-            contract_id=contract_id,
-        )
-        for item in extracted_params:
-            if item.get("requires_manual_review"):
-                any_manual_review = True
-            db.add(ContractParameterExtracted(
-                contract_id=contract_id,
-                header_name=item["header_name"],
-                param_name=item["param_name"],
-                original_extract=item["original_extract"],
-                user_override=item["user_override"],
-                match_score=item["match_score"],
-                citation_text=item["citation_text"],
-                citation_start=item["citation_start"],
-                citation_end=item["citation_end"],
-                spatial_json=item["spatial_json"],
-                vector_embed=item["vector_embed"],
-                source_query=item["source_query"],
-                is_user_added=False,
-            ))
-
-    # ── Circuit-breaker workflow escalation ───────────────────────────────────
-    if any_manual_review:
-        contract.workflow_state = "MANUAL_REVIEW"
-        _write_audit(
-            db, contract_id, "MANUAL_REVIEW_REQUIRED", "SYSTEM_EXTRACTION_ENGINE",
-            "workflow_state", "STAGED_DRAFT", "MANUAL_REVIEW",
-        )
-    else:
-        _write_audit(db, contract_id, "UPLOAD", user_id, "workflow_state", None, contract.workflow_state)
+    contract.workflow_state = "TAG_SUGGESTION_READY"
+    _write_audit(
+        db, contract_id, "TAG_SUGGESTIONS_GENERATED", "SYSTEM_AI",
+        "workflow_state", "PARSING", "TAG_SUGGESTION_READY",
+    )
 
     await db.commit()
 
@@ -689,6 +717,320 @@ async def upload_contract(
 
 
 # ── Serve raw document (for PDF viewer) ───────────────────────────────────────
+
+
+async def _execute_extraction_pipeline(db: AsyncSession, contract_id: str, user_id: str):
+    """
+    Executes the complete parameter extraction, deterministic validation, and risk assessment pipeline.
+    Saves validation results and risk metrics directly on draft master and parameter tables.
+    """
+    contract = await db.get(ContractMaster, contract_id)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    # ── Phase 1: EXTRACTION_RUNNING ──────────────────────────────────────────
+    contract.workflow_state = "EXTRACTION_RUNNING"
+    await db.flush()
+
+    active_rules = await _load_active_rules(db, contract.contract_type, contract.agreement_type)
+    rule_payloads = [_build_rule_payload(r) for r in active_rules]
+
+    # If no rules exist, classify and inject dynamic rules
+    if not active_rules:
+        resolved_ct, resolved_at, rule_payloads = await _classify_and_inject_rules(
+            document_text=contract.document_text,
+            submitted_contract_type=contract.contract_type,
+            submitted_agreement_type=contract.agreement_type,
+            db=db,
+            contract_id=contract_id,
+        )
+        contract.contract_type = resolved_ct
+        contract.agreement_type = resolved_at
+        await db.flush()
+
+    # ── Phase 2: GROUNDING_RUNNING ───────────────────────────────────────────
+    contract.workflow_state = "GROUNDING_RUNNING"
+    await db.flush()
+
+    extracted_params = await extraction_engine.run_extraction_for_rules(
+        document_text=contract.document_text,
+        rules=rule_payloads,
+        file_bytes=contract.document_blob,
+        content_type=contract.uploaded_content_type,
+        coord_index=None,
+        db=db,
+        contract_id=contract_id,
+    )
+
+    # ── Phase 3: VALIDATION_RUNNING ──────────────────────────────────────────
+    contract.workflow_state = "VALIDATION_RUNNING"
+    await db.flush()
+
+    # Clear existing extracted parameters if any
+    existing_params = await db.execute(
+        select(ContractParameterExtracted).where(ContractParameterExtracted.contract_id == contract_id)
+    )
+    for ep in existing_params.scalars().all():
+        await db.delete(ep)
+    await db.flush()
+
+    # Map extracted params
+    param_instances = []
+    for item in extracted_params:
+        p = ContractParameterExtracted(
+            contract_id=contract_id,
+            header_name=item["header_name"],
+            param_name=item["param_name"],
+            original_extract=item["original_extract"],
+            user_override=item["user_override"],
+            match_score=item["match_score"],
+            citation_text=item["citation_text"],
+            citation_start=item["citation_start"],
+            citation_end=item["citation_end"],
+            spatial_json=item["spatial_json"],
+            vector_embed=emb.quantize_to_int8(item["vector_embed"]),
+            source_query=item["source_query"],
+            is_user_added=False,
+            # Add embedding metadata!
+            embed_model_name=settings.sentence_transformer_model,
+            embed_dimension=settings.embedding_vector_dim,
+            embed_quant_type="INT8",
+            parser_version=settings.parser_version,
+            chunking_version=settings.chunking_version,
+        )
+        db.add(p)
+        param_instances.append(p)
+
+    await db.flush()
+
+    # Apply deterministic validation
+    # Map model attributes to dictionaries for ValidationService
+    param_dicts = []
+    for p in param_instances:
+        param_dicts.append({
+            "param_name": p.param_name,
+            "original_extract": p.original_extract,
+            "user_override": p.user_override,
+            "citation_text": p.citation_text,
+            "_instance": p
+        })
+
+    validation_service.validate_contract_parameters(param_dicts)
+    
+    # Write back validation results
+    for pd in param_dicts:
+        p = pd["_instance"]
+        p.validation_state = pd.get("validation_state", "needs_review")
+        p.validation_message = pd.get("validation_message")
+
+    # Run RiskAgent
+    risk_params = []
+    for p in param_instances:
+        risk_params.append({
+            "param_name": p.param_name,
+            "original_extract": p.original_extract,
+            "user_override": p.user_override,
+        })
+    score, level, rationale = await risk_agent.assess_risk(
+        contract.contract_type, contract.agreement_type, risk_params
+    )
+    contract.risk_score = score
+    contract.risk_level = level
+    contract.risk_rationale = rationale
+
+    # Check for manual review / fallback
+    any_manual_review = any(
+        p.validation_state in ("invalid", "needs_review", "missing_evidence")
+        for p in param_instances
+    )
+    
+    if any_manual_review:
+        contract.workflow_state = "REVIEW_PENDING"
+        _write_audit(
+            db, contract_id, "MANUAL_REVIEW_REQUIRED", "SYSTEM_VALIDATION",
+            "workflow_state", "VALIDATION_RUNNING", "REVIEW_PENDING"
+        )
+    else:
+        contract.workflow_state = "DRAFT_READY"
+        _write_audit(
+            db, contract_id, "EXTRACTION_COMPLETE", "SYSTEM_EXTRACTION_ENGINE",
+            "workflow_state", "VALIDATION_RUNNING", "DRAFT_READY"
+        )
+
+    await db.flush()
+
+
+def _serialize_tag_suggestions(s: ContractTagSuggestion) -> ContractTagSuggestionResponse:
+    return ContractTagSuggestionResponse(
+        suggestion_id=s.suggestion_id,
+        contract_id=s.contract_id,
+        contract_type={"value": s.contract_type or "", "confidence": float(s.contract_type_confidence or 0.0), "rationale": s.contract_type_rationale or ""},
+        business_unit={"value": s.business_unit or "", "confidence": float(s.business_unit_confidence or 0.0), "rationale": s.business_unit_rationale or ""},
+        risk_level={"value": s.risk_level or "MEDIUM", "confidence": float(s.risk_level_confidence or 0.0), "rationale": s.risk_level_rationale or ""},
+        jurisdiction={"value": s.jurisdiction or "", "confidence": float(s.jurisdiction_confidence or 0.0), "rationale": s.jurisdiction_rationale or ""},
+        workflow_route={"value": s.workflow_route or "", "confidence": float(s.workflow_route_confidence or 0.0), "rationale": s.workflow_route_rationale or ""},
+        extraction_template={"value": s.extraction_template or "", "confidence": float(s.extraction_template_confidence or 0.0), "rationale": s.extraction_template_rationale or ""},
+        created_at=s.created_at,
+    )
+
+
+@router.get("/{contract_id}/suggest-tags", response_model=ContractTagSuggestionResponse)
+async def get_suggested_tags(contract_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Returns suggested contract tags, confidence metrics, and rationale.
+    If none exist (uploaded previously), runs TaggingAgent on-the-fly.
+    """
+    contract = await db.get(ContractMaster, contract_id)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    result = await db.execute(
+        select(ContractTagSuggestion).where(ContractTagSuggestion.contract_id == contract_id)
+    )
+    s = result.scalars().first()
+    if s is not None:
+        return _serialize_tag_suggestions(s)
+
+    # Fallback suggestion generation
+    suggestions = await tagging_agent.suggest_tags(contract.document_text or "", contract.uploaded_filename)
+    s = ContractTagSuggestion(
+        contract_id=contract_id,
+        contract_type=suggestions["contract_type"]["value"],
+        contract_type_confidence=suggestions["contract_type"]["confidence"],
+        contract_type_rationale=suggestions["contract_type"]["rationale"],
+        business_unit=suggestions["business_unit"]["value"],
+        business_unit_confidence=suggestions["business_unit"]["confidence"],
+        business_unit_rationale=suggestions["business_unit"]["rationale"],
+        risk_level=suggestions["risk_level"]["value"],
+        risk_level_confidence=suggestions["risk_level"]["confidence"],
+        risk_level_rationale=suggestions["risk_level"]["rationale"],
+        jurisdiction=suggestions["jurisdiction"]["value"],
+        jurisdiction_confidence=suggestions["jurisdiction"]["confidence"],
+        jurisdiction_rationale=suggestions["jurisdiction"]["rationale"],
+        workflow_route=suggestions["workflow_route"]["value"],
+        workflow_route_confidence=suggestions["workflow_route"]["confidence"],
+        workflow_route_rationale=suggestions["workflow_route"]["rationale"],
+        extraction_template=suggestions["extraction_template"]["value"],
+        extraction_template_confidence=suggestions["extraction_template"]["confidence"],
+        extraction_template_rationale=suggestions["extraction_template"]["rationale"],
+    )
+    db.add(s)
+    await db.commit()
+    await db.refresh(s)
+    return _serialize_tag_suggestions(s)
+
+
+@router.post("/{contract_id}/accept-tags", response_model=ContractResponse)
+async def accept_tags(contract_id: str, payload: TagSuggestionsAcceptRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Accepts suggested upload-time tags and triggers the extraction/grounding/validation pipeline.
+    """
+    contract = await db.get(ContractMaster, contract_id)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    result = await db.execute(
+        select(ContractTagSuggestion).where(ContractTagSuggestion.contract_id == contract_id)
+    )
+    s = result.scalars().first()
+    if s is None:
+        raise HTTPException(status_code=400, detail="No tag suggestions exist for this contract to accept.")
+
+    prev_state = contract.workflow_state
+    contract.contract_type = s.contract_type
+    contract.business_unit = s.business_unit
+    contract.jurisdiction = s.jurisdiction
+
+    _write_audit(
+        db, contract_id, "TAG_SUGGESTIONS_ACCEPTED", payload.modified_by,
+        "contract_type/business_unit", f"{contract.contract_type}/{contract.business_unit}"
+    )
+
+    await _execute_extraction_pipeline(db, contract_id, payload.modified_by)
+    await db.commit()
+
+    saved = await _load_contract(db, contract_id)
+    return _serialize_contract(saved)
+
+
+@router.post("/{contract_id}/edit-tags", response_model=ContractResponse)
+async def edit_tags(contract_id: str, payload: TagSuggestionsEditRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Accepts user-edited tags and triggers the extraction/grounding/validation pipeline.
+    """
+    contract = await db.get(ContractMaster, contract_id)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    prev_state = contract.workflow_state
+    if payload.contract_type:
+        contract.contract_type = payload.contract_type
+    if payload.business_unit:
+        contract.business_unit = payload.business_unit
+    if payload.jurisdiction:
+        contract.jurisdiction = payload.jurisdiction
+
+    _write_audit(
+        db, contract_id, "TAG_SUGGESTIONS_EDITED", payload.modified_by,
+        "contract_type/business_unit", f"{contract.contract_type}/{contract.business_unit}"
+    )
+
+    await _execute_extraction_pipeline(db, contract_id, payload.modified_by)
+    await db.commit()
+
+    saved = await _load_contract(db, contract_id)
+    return _serialize_contract(saved)
+
+
+@router.post("/{contract_id}/pause", response_model=DraftPauseResponse)
+async def pause_draft_review(contract_id: str, payload: DraftPauseRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Persists mid-review draft review state to Oracle database and marks status as PAUSED.
+    """
+    contract = await db.get(ContractMaster, contract_id)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    prev = contract.workflow_state
+    contract.workflow_state = "PAUSED"
+    contract.draft_checkpoint = payload.checkpoint_json
+
+    _write_audit(
+        db, contract_id, "DRAFT_PAUSED", payload.modified_by,
+        "workflow_state", prev, "PAUSED"
+    )
+    await db.commit()
+
+    return DraftPauseResponse(
+        contract_id=contract_id,
+        workflow_state="PAUSED",
+        draft_checkpoint=contract.draft_checkpoint
+    )
+
+
+@router.post("/{contract_id}/resume", response_model=DraftPauseResponse)
+async def resume_draft_review(contract_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Restores the contract review from PAUSED state back to USER_EDITING and fetches stored review state.
+    """
+    contract = await db.get(ContractMaster, contract_id)
+    if not contract:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    prev = contract.workflow_state
+    contract.workflow_state = "USER_EDITING"
+
+    _write_audit(
+        db, contract_id, "DRAFT_RESUMED", contract.checked_out_by or "SYSTEM",
+        "workflow_state", prev, "USER_EDITING"
+    )
+    await db.commit()
+
+    return DraftPauseResponse(
+        contract_id=contract_id,
+        workflow_state="USER_EDITING",
+        draft_checkpoint=contract.draft_checkpoint
+    )
 
 
 @router.get("/{contract_id}/document")
@@ -806,7 +1148,7 @@ async def semantic_search_contracts(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Searches contracts by semantic similarity using Oracle 23ai VECTOR_DISTANCE.
+    Searches contracts by semantic similarity using Oracle 26ai VECTOR_DISTANCE.
     Returns contracts ranked by relevance to the natural language query.
     Falls back to an empty result (not an error) if embeddings are unavailable.
     """
@@ -969,8 +1311,6 @@ async def _transition(db, contract_id, state, payload, action_type):
         raise HTTPException(status_code=404, detail="Contract not found")
     prev = contract.workflow_state
     contract.workflow_state = state
-    if state == "APPROVED":
-        contract.approved_by = payload.modified_by
     note = f"{state} | {payload.comment}" if payload.comment else state
     _write_audit(db, contract_id, action_type, payload.modified_by, "workflow_state", prev, note)
     await db.commit()
@@ -987,7 +1327,41 @@ async def submit_for_approval(contract_id: str, payload: WorkflowActionRequest, 
 
 @router.post("/{contract_id}/approve")
 async def approve_contract(contract_id: str, payload: WorkflowActionRequest, db: AsyncSession = Depends(get_db)):
-    return await _transition(db, contract_id, "APPROVED", payload, "APPROVE_CONTRACT")
+    """
+    Transitions the contract to APPROVED state and atomically promotes it to the
+    published tables via PublishingService.promote().
+
+    The state change and the promotion are committed in the same transaction.
+    If promotion fails, we log a warning but do NOT block the approval \u2014 the
+    PublishingService is idempotent and can be retried. The contract will still be
+    marked APPROVED in the draft table.
+    """
+    contract = await db.get(ContractMaster, contract_id)
+    if contract is None:
+        raise HTTPException(status_code=404, detail="Contract not found")
+
+    prev = contract.workflow_state
+    contract.workflow_state = "APPROVED"
+    contract.approved_by = payload.modified_by
+    note = f"APPROVED | {payload.comment}" if payload.comment else "APPROVED"
+    _write_audit(db, contract_id, "APPROVE_CONTRACT", payload.modified_by, "workflow_state", prev, note)
+
+    # Promote to published tables before committing so both changes are atomic.
+    try:
+        await publishing_service.promote(
+            db=db,
+            contract_id=contract_id,
+            approved_by=payload.modified_by,
+        )
+    except Exception as exc:
+        clm_logger.warning(
+            f"[Approve] PublishingService.promote() failed for contract '{contract_id}': {exc}. "
+            "Approval state change will still be committed. Promotion is idempotent and can be retried.",
+            exc_info=True,
+        )
+
+    await db.commit()
+    return {"status": "APPROVED"}
 
 @router.post("/{contract_id}/send-back")
 async def send_back_contract(contract_id: str, payload: WorkflowActionRequest, db: AsyncSession = Depends(get_db)):

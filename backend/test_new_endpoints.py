@@ -24,34 +24,34 @@ async def test_new_endpoints():
         # Test organizations
         try:
             resp = await client.get(f"{BASE_URL}/metadata/organizations")
-            print(f"✓ GET /metadata/organizations: {resp.status_code}")
+            print(f"[PASS] GET /metadata/organizations: {resp.status_code}")
             print(f"  Organizations: {resp.json()}\n")
         except Exception as e:
-            print(f"✗ Metadata Organizations Error: {e}\n")
+            print(f"[FAIL] Metadata Organizations Error: {e}\n")
         
         # Test business units
         try:
             resp = await client.get(f"{BASE_URL}/metadata/business-units")
-            print(f"✓ GET /metadata/business-units: {resp.status_code}")
+            print(f"[PASS] GET /metadata/business-units: {resp.status_code}")
             print(f"  Business Units: {resp.json()}\n")
         except Exception as e:
-            print(f"✗ Metadata Business Units Error: {e}\n")
+            print(f"[FAIL] Metadata Business Units Error: {e}\n")
         
         # Test contract types
         try:
             resp = await client.get(f"{BASE_URL}/metadata/contract-types")
-            print(f"✓ GET /metadata/contract-types: {resp.status_code}")
+            print(f"[PASS] GET /metadata/contract-types: {resp.status_code}")
             print(f"  Contract Types: {resp.json()}\n")
         except Exception as e:
-            print(f"✗ Metadata Contract Types Error: {e}\n")
+            print(f"[FAIL] Metadata Contract Types Error: {e}\n")
         
         # Test agreement types
         try:
             resp = await client.get(f"{BASE_URL}/metadata/agreement-types")
-            print(f"✓ GET /metadata/agreement-types: {resp.status_code}")
+            print(f"[PASS] GET /metadata/agreement-types: {resp.status_code}")
             print(f"  Agreement Types: {resp.json()}\n")
         except Exception as e:
-            print(f"✗ Metadata Agreement Types Error: {e}\n")
+            print(f"[FAIL] Metadata Agreement Types Error: {e}\n")
         
         # ============ DASHBOARD ENDPOINTS ============
         print("\nTesting Dashboard Endpoints...")
@@ -60,31 +60,31 @@ async def test_new_endpoints():
         # Test dashboard stats
         try:
             resp = await client.get(f"{BASE_URL}/dashboard/stats")
-            print(f"✓ GET /dashboard/stats: {resp.status_code}")
+            print(f"[PASS] GET /dashboard/stats: {resp.status_code}")
             data = resp.json()
             print(f"  Total Contracts: {data.get('total_contracts', 'N/A')}")
             print(f"  Pending Approvals: {data.get('pending_approvals', 'N/A')}")
             print(f"  Expired Contracts: {data.get('expired_contracts', 'N/A')}\n")
         except Exception as e:
-            print(f"✗ Dashboard Stats Error: {e}\n")
+            print(f"[FAIL] Dashboard Stats Error: {e}\n")
         
         # Test recent contracts
         try:
             resp = await client.get(f"{BASE_URL}/dashboard/recent?limit=5")
-            print(f"✓ GET /dashboard/recent: {resp.status_code}")
+            print(f"[PASS] GET /dashboard/recent: {resp.status_code}")
             data = resp.json()
             print(f"  Recent Contracts Count: {len(data.get('data', []))}\n")
         except Exception as e:
-            print(f"✗ Dashboard Recent Error: {e}\n")
+            print(f"[FAIL] Dashboard Recent Error: {e}\n")
         
         # Test pending approvals
         try:
             resp = await client.get(f"{BASE_URL}/dashboard/pending-approvals")
-            print(f"✓ GET /dashboard/pending-approvals: {resp.status_code}")
+            print(f"[PASS] GET /dashboard/pending-approvals: {resp.status_code}")
             data = resp.json()
             print(f"  Pending Approvals Count: {len(data.get('data', []))}\n")
         except Exception as e:
-            print(f"✗ Dashboard Pending Approvals Error: {e}\n")
+            print(f"[FAIL] Dashboard Pending Approvals Error: {e}\n")
         
         # ============ MAINTENANCE ENDPOINTS ============
         print("\nTesting Maintenance Endpoints...")
@@ -93,31 +93,31 @@ async def test_new_endpoints():
         # Test status
         try:
             resp = await client.get(f"{BASE_URL}/maintenance/status")
-            print(f"✓ GET /maintenance/status: {resp.status_code}")
+            print(f"[PASS] GET /maintenance/status: {resp.status_code}")
             data = resp.json()
             print(f"  System Status: {data.get('status', 'N/A')}")
             print(f"  Database: {data.get('database', 'N/A')}")
             print(f"  API: {data.get('api', 'N/A')}\n")
         except Exception as e:
-            print(f"✗ Maintenance Status Error: {e}\n")
+            print(f"[FAIL] Maintenance Status Error: {e}\n")
         
         # Test logs
         try:
             resp = await client.get(f"{BASE_URL}/maintenance/logs?limit=10")
-            print(f"✓ GET /maintenance/logs: {resp.status_code}")
+            print(f"[PASS] GET /maintenance/logs: {resp.status_code}")
             data = resp.json()
             print(f"  Error Logs Count: {len(data.get('data', []))}\n")
         except Exception as e:
-            print(f"✗ Maintenance Logs Error: {e}\n")
+            print(f"[FAIL] Maintenance Logs Error: {e}\n")
         
         # Test sync
         try:
             resp = await client.post(f"{BASE_URL}/maintenance/sync")
-            print(f"✓ POST /maintenance/sync: {resp.status_code}")
+            print(f"[PASS] POST /maintenance/sync: {resp.status_code}")
             data = resp.json()
             print(f"  Sync Status: {data.get('status', 'N/A')}\n")
         except Exception as e:
-            print(f"✗ Maintenance Sync Error: {e}\n")
+            print(f"[FAIL] Maintenance Sync Error: {e}\n")
         
         # ============ CONTRACT SEARCH & AUDIT ============
         print("\nTesting Contract Advanced Endpoints...")
@@ -126,46 +126,47 @@ async def test_new_endpoints():
         # Test search
         try:
             resp = await client.get(f"{BASE_URL}/contracts/search?query=&org=&status=")
-            print(f"✓ GET /contracts/search: {resp.status_code}")
+            print(f"[PASS] GET /contracts/search: {resp.status_code}")
             data = resp.json()
             print(f"  Search Results Count: {len(data.get('data', []))}\n")
         except Exception as e:
-            print(f"✗ Contract Search Error: {e}\n")
+            print(f"[FAIL] Contract Search Error: {e}\n")
         
         # First, get a contract ID for audit testing
         try:
             resp = await client.get(f"{BASE_URL}/contracts")
             contracts = resp.json()
-            if contracts and len(contracts) > 0:
-                contract_id = contracts[0]['contract_id']
+            contracts_list = contracts.get('data', [])
+            if contracts_list and len(contracts_list) > 0:
+                contract_id = contracts_list[0]['contract_id']
                 
                 # Test audit trail
                 try:
                     resp = await client.get(f"{BASE_URL}/contracts/{contract_id}/audit")
-                    print(f"✓ GET /contracts/{contract_id}/audit: {resp.status_code}")
+                    print(f"[PASS] GET /contracts/{contract_id}/audit: {resp.status_code}")
                     data = resp.json()
                     print(f"  Audit Records: {len(data.get('audit_trail', []))}\n")
                 except Exception as e:
-                    print(f"✗ Contract Audit Error: {e}\n")
+                    print(f"[FAIL] Contract Audit Error: {e}\n")
                 
                 # Test parameters
                 try:
                     resp = await client.get(f"{BASE_URL}/contracts/{contract_id}/parameters")
-                    print(f"✓ GET /contracts/{contract_id}/parameters: {resp.status_code}")
+                    print(f"[PASS] GET /contracts/{contract_id}/parameters: {resp.status_code}")
                     data = resp.json()
                     print(f"  Parameters Count: {len(data.get('parameters', []))}\n")
                 except Exception as e:
-                    print(f"✗ Contract Parameters Error: {e}\n")
+                    print(f"[FAIL] Contract Parameters Error: {e}\n")
                 
                 # Test extraction status
                 try:
                     resp = await client.get(f"{BASE_URL}/contracts/{contract_id}/extraction-status")
-                    print(f"✓ GET /contracts/{contract_id}/extraction-status: {resp.status_code}")
+                    print(f"[PASS] GET /contracts/{contract_id}/extraction-status: {resp.status_code}")
                     data = resp.json()
                     print(f"  Status: {data.get('status', 'N/A')}")
                     print(f"  Total Parameters: {data.get('total', 'N/A')}\n")
                 except Exception as e:
-                    print(f"✗ Contract Extraction Status Error: {e}\n")
+                    print(f"[FAIL] Contract Extraction Status Error: {e}\n")
                 
                 # Test verification
                 try:
@@ -178,13 +179,13 @@ async def test_new_endpoints():
                             f"{BASE_URL}/verification/{contract_id}/{param_id}/verify",
                             json={"is_correct": True}
                         )
-                        print(f"✓ POST /verification/{contract_id}/{param_id}/verify: {resp.status_code}")
+                        print(f"[PASS] POST /verification/{contract_id}/{param_id}/verify: {resp.status_code}")
                         data = resp.json()
                         print(f"  Response: {data}\n")
                 except Exception as e:
-                    print(f"✗ Verification Error: {e}\n")
+                    print(f"[FAIL] Verification Error: {e}\n")
         except Exception as e:
-            print(f"✗ Error getting contracts for audit testing: {e}\n")
+            print(f"[FAIL] Error getting contracts for audit testing: {e}\n")
         
         print("\n=== TEST SUITE COMPLETE ===")
 

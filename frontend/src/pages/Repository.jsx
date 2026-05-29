@@ -129,7 +129,7 @@ const Repository = () => {
                       className="px-sm py-xs rounded bg-primary text-on-primary text-xs font-semibold"
                       onClick={() => {
                         localStorage.setItem('currentContractId', contract.contract_id);
-                        navigate('/verification');
+                        navigate('/extraction');
                       }}
                     >
                       Open

@@ -29,6 +29,7 @@ backend/app/models/*.pyc
 backend/app/schemas/__pycache__/
 backend/app/schemas/*.pyc
 backend/app/services/__pycache__/
+backend/app/services/agents/__pycache__/
 backend/app/services/*.pyc
 backend/app/utils/__pycache__/
 backend/app/utils/*.pyc

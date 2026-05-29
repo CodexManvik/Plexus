@@ -53,7 +53,7 @@ from typing import Any, Dict, List, Optional, Sequence, TypedDict
 
 from app.config import settings
 from app.services import embeddings as emb
-from app.services.llm import azure_llm
+from app.services.llm import cohere_llm
 from app.services.logger import clm_logger
 
 # CoordIndex is defined in document_parser; import lazily to avoid circular deps
@@ -338,7 +338,7 @@ async def _extractor_node(state: ExtractionState) -> ExtractionState:
     )
 
     try:
-        raw = await azure_llm.get_extraction_completion(
+        raw = await cohere_llm.get_extraction_completion(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
         )
@@ -652,6 +652,7 @@ async def _run_section_group(
         # ── Run each rule through the state machine ───────────────────────────
         results: List[Dict[str, Any]] = []
         for rule in rules:
+            rule_start_time = asyncio.get_event_loop().time()
             state: ExtractionState = {
                 "rule": rule,
                 "document_text": document_text,
@@ -712,10 +713,17 @@ async def _run_section_group(
                     existing_ids = {c.get("chunk_id") for c in (state.get("pre_fetched_chunks") or [])}
                     new_chunks = [h for h in extra_hits if h.get("chunk_id") not in existing_ids]
                     if new_chunks:
-                        clm_logger.info(f"[Extraction] Second-pass found {len(new_chunks)} new chunks. Appending top 6 to context.")
+                        clm_logger.info(
+                            f"[Extraction] Second-pass found {len(new_chunks)} new chunks. "
+                            f"Appending top 6 to context. "
+                            f"Carrying forward retry_count={state.get('retry_count', 0)} "
+                            f"against budget={settings.extraction_max_critic_retries}."
+                        )
                         state["pre_fetched_chunks"] = (state.get("pre_fetched_chunks") or []) + new_chunks[:6]
                         state["critic_feedback"] = None
-                        state["retry_count"] = 0
+                        # NOTE: retry_count is NOT reset here — the first-pass budget carries forward
+                        # so that the combined attempt count is measured against the single circuit-breaker
+                        # budget. Resetting it here would allow a parameter to silently bypass the limit.
                         # Re-run extraction with expanded context
                         state = await _extractor_node(state)
                         while True:
@@ -743,6 +751,28 @@ async def _run_section_group(
             if state.get("result") is not None:
                 embed_input = state.get("citation") or state.get("value") or ""
                 state["result"]["vector_embed"] = await asyncio.to_thread(_safe_embed, embed_input)
+
+            # ── Structured extraction telemetry (log only, no DB write) ──────────
+            rule_latency_ms = round((asyncio.get_event_loop().time() - rule_start_time) * 1000, 1)
+            param_head = (rule.get("parameter_head") or "").strip()
+            param_name_log = (rule.get("parameter_name") or "").strip()
+            extraction_result = state.get("value")
+            citation_verified = (
+                state.get("critic_feedback") is None
+                and bool(state.get("citation"))
+            )
+            clm_logger.info(
+                "[ExtractionTelemetry] "
+                f"contract_id={contract_id!r} "
+                f"parameter_head={param_head!r} "
+                f"parameter_name={param_name_log!r} "
+                f"extraction_result={str(extraction_result)[:120]!r} "
+                f"citation_verified={citation_verified} "
+                f"retry_count={state.get('retry_count', 0)} "
+                f"circuit_broken={state.get('circuit_broken', False)} "
+                f"total_latency_ms={rule_latency_ms}"
+            )
+
             results.append(state["result"])
 
         clm_logger.info(f"[Extraction] Completed section group '{section_name}' processing.")

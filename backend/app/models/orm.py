@@ -1,4 +1,5 @@
 import json
+from decimal import Decimal
 
 from sqlalchemy import (
     Identity,
@@ -51,7 +52,15 @@ class OracleNativeJSON(TypeDecorator):
             return None
         if dialect.name != "oracle":
             return value
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+        def decimal_default(obj):
+            if isinstance(obj, Decimal):
+                if obj % 1 == 0:
+                    return int(obj)
+                return float(obj)
+            raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+        return json.dumps(value, default=decimal_default, ensure_ascii=False, separators=(",", ":"))
 
     def process_result_value(self, value, dialect):
         if value is None:
@@ -109,7 +118,7 @@ class ContractMaster(Base):
     document_text = Column(Text, nullable=True)
 
     # Updated: Native VECTOR definition for direct 26ai serialization tracking
-    document_vector = Column(VECTOR(settings.embedding_vector_dim, storage_format=VectorStorageFormat.FLOAT32), nullable=True)
+    document_vector = Column(VECTOR(settings.embedding_vector_dim, storage_format=VectorStorageFormat.INT8), nullable=True)
 
     workflow_state = Column(
         String(30), default="STAGED_DRAFT", server_default="STAGED_DRAFT", nullable=False
@@ -119,6 +128,11 @@ class ContractMaster(Base):
     document_version = Column(Integer, default=1, server_default="1", nullable=False)
     created_by = Column(String(100), nullable=True)
     approved_by = Column(String(100), nullable=True)
+
+    risk_score = Column(Numeric(precision=5, scale=2), nullable=True)
+    risk_level = Column(String(30), nullable=True)
+    risk_rationale = Column(Text, nullable=True)
+    draft_checkpoint = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=func.now(), server_default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now(), server_default=func.now())
@@ -141,6 +155,12 @@ class ContractMaster(Base):
         back_populates="contract",
         cascade="all, delete-orphan",
         lazy="noload",  # Never eager-load; queried directly by vector search.
+    )
+    tag_suggestions = relationship(
+        "ContractTagSuggestion",
+        back_populates="contract",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
 
@@ -165,12 +185,23 @@ class ContractParameterExtracted(Base):
     spatial_json = Column(OracleNativeJSON(), nullable=True)
 
     # Updated: Native VECTOR definition for direct 26ai serialization tracking
-    vector_embed = Column(VECTOR(settings.embedding_vector_dim, storage_format=VectorStorageFormat.FLOAT32), nullable=True)
+    vector_embed = Column(VECTOR(settings.embedding_vector_dim, storage_format=VectorStorageFormat.INT8), nullable=True)
 
     source_query = Column(String(250), nullable=True)
     is_user_added = Column(Boolean, default=False, nullable=False)
     is_verified = Column(Boolean, default=False, nullable=False)
     verification_note = Column(Text, nullable=True)
+    validation_state = Column(String(30), default="needs_review", server_default="needs_review", nullable=False)
+    validation_message = Column(Text, nullable=True)
+
+    # Embedding versioning metadata
+    embed_model_name = Column(String(100), nullable=True)
+    embed_dimension = Column(Integer, nullable=True)
+    embed_quant_type = Column(String(30), nullable=True)
+    parser_version = Column(String(50), nullable=True)
+    chunking_version = Column(String(50), nullable=True)
+    embed_created_at = Column(DateTime, default=func.now(), server_default=func.now())
+
     last_modified = Column(DateTime, default=func.now(), onupdate=func.now())
 
     contract = relationship("ContractMaster", back_populates="parameters")
@@ -182,7 +213,7 @@ class ContractDocumentChunk(Base):
     Accumulation parser.  Each chunk carries:
       - its global character offsets into ContractMaster.document_text,
       - a spatial_json array of per-line bounding boxes for frontend highlighting,
-      - a VECTOR embedding for Oracle 23ai cosine similarity search.
+      - a VECTOR embedding for Oracle 26ai cosine similarity search.
     """
     __tablename__ = "contract_document_chunks"
     __table_args__ = (
@@ -202,7 +233,15 @@ class ContractDocumentChunk(Base):
     spatial_json = Column(OracleNativeJSON(), nullable=True)
 
     # Paragraph-level vector for granular RAG retrieval.
-    chunk_vector = Column(VECTOR(settings.embedding_vector_dim, storage_format=VectorStorageFormat.FLOAT32), nullable=True)
+    chunk_vector = Column(VECTOR(settings.embedding_vector_dim, storage_format=VectorStorageFormat.INT8), nullable=True)
+
+    # Embedding versioning metadata
+    embed_model_name = Column(String(100), nullable=True)
+    embed_dimension = Column(Integer, nullable=True)
+    embed_quant_type = Column(String(30), nullable=True)
+    parser_version = Column(String(50), nullable=True)
+    chunking_version = Column(String(50), nullable=True)
+    embed_created_at = Column(DateTime, default=func.now(), server_default=func.now())
 
     contract = relationship("ContractMaster", back_populates="chunks")
 
@@ -259,3 +298,172 @@ class MetadataOption(Base):
     value = Column(String(200), nullable=False)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=func.now(), server_default=func.now())
+
+
+# ───────────────── Published Tables (approved / trusted corpus) ───────────────────────────────────────────────────────────────────
+#
+# The published tables are a separate trust zone from the draft tables.
+# Presence in these tables IS the publication signal — no workflow_state column.
+# There is deliberately no CASCADE DELETE from contracts_master: published records
+# must survive any future archival or re-classification of the source draft.
+
+
+class PublishedContract(Base):
+    """
+    One row per approved contract publication event.
+    Promotes key metadata from ContractMaster at approval time.
+    """
+    __tablename__ = "published_contracts"
+
+    published_id = Column(Integer, Identity(start=1), primary_key=True)
+    # Reference back to the source draft — NOT a CASCADE FK by design.
+    contract_id = Column(String(50), nullable=False, index=True)
+    contract_type = Column(String(100), nullable=False)
+    agreement_type = Column(String(100), nullable=False)
+    organization = Column(String(100), nullable=False)
+    business_unit = Column(String(100), nullable=False)
+    customer_partner_name = Column(String(200), nullable=True)
+    effective_date = Column(Date, nullable=True)
+    approved_by = Column(String(100), nullable=False)
+    approved_at = Column(DateTime, nullable=True)
+
+    risk_score = Column(Numeric(precision=5, scale=2), nullable=True)
+    risk_level = Column(String(30), nullable=True)
+    risk_rationale = Column(Text, nullable=True)
+
+    published_at = Column(DateTime, default=func.now(), server_default=func.now())
+
+    parameters = relationship(
+        "PublishedParameter",
+        back_populates="published_contract",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+    chunks = relationship(
+        "PublishedChunk",
+        back_populates="published_contract",
+        cascade="all, delete-orphan",
+        lazy="noload",
+    )
+
+
+class PublishedParameter(Base):
+    """
+    Approved parameter values promoted from ContractParameterExtracted.
+    effective_value = user_override if present, else original_extract.
+    Embedding is copied as-is from the draft row.
+    """
+    __tablename__ = "published_parameters"
+
+    published_param_id = Column(Integer, Identity(start=1), primary_key=True)
+    published_id = Column(
+        Integer,
+        ForeignKey("published_contracts.published_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # Denormalized for direct query without joins.
+    contract_id = Column(String(50), nullable=False, index=True)
+    header_name = Column(String(150), nullable=False)
+    param_name = Column(String(150), nullable=False)
+    # Resolved at promotion time: user_override if set, else original_extract.
+    effective_value = Column(Text, nullable=True)
+    citation_text = Column(Text, nullable=True)
+    citation_start = Column(Integer, nullable=True)
+    citation_end = Column(Integer, nullable=True)
+    spatial_json = Column(OracleNativeJSON(), nullable=True)
+    vector_embed = Column(
+        VECTOR(settings.embedding_vector_dim, storage_format=VectorStorageFormat.INT8),
+        nullable=True,
+    )
+    source_query = Column(String(250), nullable=True)
+    validation_state = Column(String(30), default="needs_review", server_default="needs_review", nullable=False)
+    validation_message = Column(Text, nullable=True)
+
+    # Embedding versioning metadata
+    embed_model_name = Column(String(100), nullable=True)
+    embed_dimension = Column(Integer, nullable=True)
+    embed_quant_type = Column(String(30), nullable=True)
+    parser_version = Column(String(50), nullable=True)
+    chunking_version = Column(String(50), nullable=True)
+    embed_created_at = Column(DateTime, default=func.now(), server_default=func.now())
+
+    published_contract = relationship("PublishedContract", back_populates="parameters")
+
+
+class PublishedChunk(Base):
+    """
+    Approved document chunks promoted from ContractDocumentChunk.
+    Spatial coordinates and vector embeddings are copied as-is.
+    """
+    __tablename__ = "published_chunks"
+
+    published_chunk_id = Column(Integer, Identity(start=1), primary_key=True)
+    published_id = Column(
+        Integer,
+        ForeignKey("published_contracts.published_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    contract_id = Column(String(50), nullable=False, index=True)
+    chunk_index = Column(Integer, nullable=False)
+    chunk_text = Column(Text, nullable=False)
+    char_start = Column(Integer, nullable=False)
+    char_end = Column(Integer, nullable=False)
+    spatial_json = Column(OracleNativeJSON(), nullable=True)
+    chunk_vector = Column(
+        VECTOR(settings.embedding_vector_dim, storage_format=VectorStorageFormat.INT8),
+        nullable=True,
+    )
+
+    # Embedding versioning metadata
+    embed_model_name = Column(String(100), nullable=True)
+    embed_dimension = Column(Integer, nullable=True)
+    embed_quant_type = Column(String(30), nullable=True)
+    parser_version = Column(String(50), nullable=True)
+    chunking_version = Column(String(50), nullable=True)
+    embed_created_at = Column(DateTime, default=func.now(), server_default=func.now())
+
+    published_contract = relationship("PublishedContract", back_populates="chunks")
+
+
+class ContractTagSuggestion(Base):
+    """
+    ContractTagSuggestion — Stores suggested metadata, confidence scores, and rationales
+    predicted at upload time.
+    """
+    __tablename__ = "contract_tag_suggestions"
+
+    suggestion_id = Column(Integer, Identity(start=1), primary_key=True)
+    contract_id = Column(
+        String(50),
+        ForeignKey("contracts_master.contract_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    contract_type = Column(String(100), nullable=True)
+    contract_type_confidence = Column(Numeric(precision=4, scale=3), nullable=True)
+    contract_type_rationale = Column(Text, nullable=True)
+
+    business_unit = Column(String(100), nullable=True)
+    business_unit_confidence = Column(Numeric(precision=4, scale=3), nullable=True)
+    business_unit_rationale = Column(Text, nullable=True)
+
+    risk_level = Column(String(30), nullable=True)
+    risk_level_confidence = Column(Numeric(precision=4, scale=3), nullable=True)
+    risk_level_rationale = Column(Text, nullable=True)
+
+    jurisdiction = Column(String(100), nullable=True)
+    jurisdiction_confidence = Column(Numeric(precision=4, scale=3), nullable=True)
+    jurisdiction_rationale = Column(Text, nullable=True)
+
+    workflow_route = Column(String(150), nullable=True)
+    workflow_route_confidence = Column(Numeric(precision=4, scale=3), nullable=True)
+    workflow_route_rationale = Column(Text, nullable=True)
+
+    extraction_template = Column(String(150), nullable=True)
+    extraction_template_confidence = Column(Numeric(precision=4, scale=3), nullable=True)
+    extraction_template_rationale = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=func.now(), server_default=func.now())
+
+    contract = relationship("ContractMaster", back_populates="tag_suggestions")

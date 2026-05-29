@@ -11,8 +11,9 @@ Architecture:
     * Each accumulated chunk maps its global (start_offset, end_offset) character range
       to a list of per-line bounding boxes: [[page, x0, y0, x1, y1, pw, ph], ...].
       The frontend uses these multi-segment line arrays for precise horizontal highlighting.
-  - DOCX: paragraph-level extraction, empty coord index.
-  - XLSX: cell-level extraction, empty coord index.
+  - DOCX / XLSX / PPTX / all other non-PDF: Microsoft MarkItDown.
+    MarkItDown converts Office formats to markdown and returns the plain text.
+    coord_index is always an empty dict for non-PDF paths.
   - Optional Marker-PDF: activated only when USE_MARKER_PARSER=true in .env AND the
     marker-pdf package is manually installed. Falls back to PyMuPDF silently.
 
@@ -26,8 +27,6 @@ from __future__ import annotations
 import io
 import re
 import sys
-import zipfile
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -341,38 +340,45 @@ def _extract_pdf_marker(file_bytes: bytes) -> tuple[str, CoordIndex]:
     return full_text, pymupdf_index
 
 
-# ── DOCX extraction ───────────────────────────────────────────────────────────
+# ── Non-PDF extraction via MarkItDown ────────────────────────────────────────
 
-def _extract_docx_text(file_bytes: bytes) -> tuple[str, CoordIndex]:
-    with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as archive:
-        xml_content = archive.read("word/document.xml")
-    root = ET.fromstring(xml_content)
-    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    paragraphs: List[str] = []
-    for para in root.findall(".//w:p", ns):
-        text = "".join(node.text for node in para.findall(".//w:t", ns) if node.text)
-        if text.strip():
-            paragraphs.append(text.strip())
-    return "\n".join(paragraphs), {}
+def _extract_non_pdf_text(file_bytes: bytes, file_name: str) -> tuple[str, CoordIndex]:
+    """
+    Converts any non-PDF document format (DOCX, XLSX, PPTX, etc.) to plain text
+    using Microsoft MarkItDown. MarkItDown converts to markdown internally; we
+    return the raw markdown string as the document text.
 
+    coord_index is always empty for non-PDF formats — no spatial layout data
+    is available from Office formats without per-format parsers.
 
-# ── XLSX extraction ───────────────────────────────────────────────────────────
-
-def _extract_xlsx_text(file_bytes: bytes) -> tuple[str, CoordIndex]:
+    Falls back to UTF-8 decode if MarkItDown is not installed or raises.
+    """
     try:
-        from openpyxl import load_workbook  # type: ignore
+        from markitdown import MarkItDown  # type: ignore  # pip install markitdown
     except ImportError:
-        return "", {}
+        print(
+            "[Parser] markitdown not installed. Run: pip install markitdown>=0.1.1",
+            file=sys.stderr,
+        )
+        # Hard fallback: best-effort UTF-8 decode.
+        return file_bytes.decode("utf-8", errors="ignore").strip(), {}
 
-    workbook = load_workbook(io.BytesIO(file_bytes), data_only=True)
-    fragments: List[str] = []
-    for sheet in workbook.worksheets:
-        fragments.append(f"[Sheet: {sheet.title}]")
-        for row in sheet.iter_rows(values_only=True):
-            cells = [str(cell).strip() for cell in row if cell not in (None, "")]
-            if cells:
-                fragments.append(" | ".join(cells))
-    return "\n".join(fragments), {}
+    try:
+        md = MarkItDown()
+        # MarkItDown.convert() accepts a file-like object or a path.
+        # We pass a BytesIO with the original filename so it can sniff the format.
+        stream = io.BytesIO(file_bytes)
+        stream.name = file_name  # type: ignore[attr-defined]  # MarkItDown reads .name for format detection
+        result = md.convert(stream)
+        text = (result.text_content or "").strip()
+        return text, {}
+    except Exception as exc:
+        print(
+            f"[Parser] MarkItDown conversion failed for '{file_name}': {exc}. "
+            "Falling back to UTF-8 decode.",
+            file=sys.stderr,
+        )
+        return file_bytes.decode("utf-8", errors="ignore").strip(), {}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -391,20 +397,22 @@ def extract_document_text(
     [[page_num, x0, y0, x1, y1, page_width, page_height], ...] enabling
     precise multi-line frontend highlighting.
 
-    Supported formats: TXT, CSV, JSON, PDF, DOCX, XLSX.
+    Supported formats:
+      Plain text  — TXT, CSV, JSON (returned as-is).
+      PDF         — PyMuPDF layout-aware extraction (or Marker-PDF if configured).
+      Office/Other — DOCX, XLSX, XLSM, PPTX, and any unrecognised format via
+                     Microsoft MarkItDown. coord_index is empty for all these.
     """
     from app.config import settings  # late import to avoid circular deps at module load
 
     suffix = Path(file_name).suffix.lower()
     ctype = (content_type or "").lower()
 
-    if suffix in {".txt", ".csv", ".json"} or ctype.startswith("text/"):
+    # ── Plain text formats: decode and return as-is ───────────────────────────
+    if suffix in {".txt", ".csv", ".json"} or ctype.startswith("text/plain"):
         return file_bytes.decode("utf-8", errors="ignore").strip(), {}
 
-    if suffix == ".docx" or "wordprocessingml" in ctype:
-        text, idx = _extract_docx_text(file_bytes)
-        return text.strip(), idx
-
+    # ── PDF: layout-aware PyMuPDF pipeline (or optional Marker-PDF) ──────────
     if suffix == ".pdf" or ctype == "application/pdf":
         if settings.use_marker_parser:
             text, idx = _extract_pdf_marker(file_bytes)
@@ -412,8 +420,8 @@ def extract_document_text(
             text, idx = _extract_pdf_text_with_index(file_bytes)
         return text.strip(), idx
 
-    if suffix in {".xlsx", ".xlsm"} or "spreadsheet" in ctype:
-        text, idx = _extract_xlsx_text(file_bytes)
-        return text.strip(), idx
-
-    return file_bytes.decode("utf-8", errors="ignore").strip(), {}
+    # ── All non-PDF office/binary formats: MarkItDown ─────────────────────────
+    # Covers: .docx, .xlsx, .xlsm, .pptx, .ppt, .doc, .odt, and any other
+    # format MarkItDown supports. coord_index is always {} for these paths.
+    text, idx = _extract_non_pdf_text(file_bytes, file_name)
+    return text.strip(), idx

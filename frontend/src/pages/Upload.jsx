@@ -8,11 +8,9 @@ const Upload = () => {
   const {
     metadata,
     updateMetadata,
-    hasRequiredMetadata,
     isDragging,
     setIsDragging,
     loading,
-    error,
     uploadFile,
     handleDrop,
   } = useUpload();
@@ -36,7 +34,7 @@ const Upload = () => {
       <div>
         <h1 className="text-3xl font-black text-primary tracking-tight">Contract Intake Portal</h1>
         <p className="text-sm text-on-surface-variant font-medium">
-          Upload multi-format assets into the Oracle 23ai parsing vector engine.
+          Upload multi-format assets into the Oracle 26ai parsing vector engine.
         </p>
       </div>
 

@@ -62,7 +62,7 @@ const Approvals = () => {
                       className="text-sm font-semibold text-primary hover:underline"
                       onClick={() => {
                         localStorage.setItem('currentContractId', item.contract_id);
-                        navigate('/verification');
+                        navigate('/extraction');
                       }}
                     >
                       {item.contract_id}

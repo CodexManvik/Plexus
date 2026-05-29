@@ -1,5 +1,5 @@
 """
-embeddings.py — embedding backends + Oracle 23ai vector search helpers.
+embeddings.py — embedding backends + Oracle 26ai vector search helpers.
 
 Supports either sentence-transformers models or a local GGUF embedding model
 through llama-cpp-python. The Oracle VECTOR dimension is configured separately
@@ -175,7 +175,14 @@ def serialize(vector: Optional[List[float]]) -> Optional[str]:
     return json.dumps(vector)
 
 
-# ── Oracle 23ai vector similarity search ──────────────────────────────────────
+def quantize_to_int8(vector: Optional[List[float]]) -> Optional[List[int]]:
+    """Quantizes a float vector in [-1.0, 1.0] to an INT8 list of integers in [-127, 127]."""
+    if vector is None:
+        return None
+    return [max(-127, min(127, int(round(x * 127)))) for x in vector]
+
+
+# ── Oracle 26ai vector similarity search ──────────────────────────────────────
 
 async def vector_search_parameters(
     db: AsyncSession,
@@ -184,7 +191,7 @@ async def vector_search_parameters(
     top_k: int = 5,
 ) -> List[dict]:
     """
-    Searches contract_parameters_extracted using Oracle 23ai VECTOR_DISTANCE
+    Searches contract_parameters_extracted using Oracle 26ai VECTOR_DISTANCE
     with cosine similarity.
 
     Falls back to empty list if embeddings are unavailable.
@@ -193,8 +200,10 @@ async def vector_search_parameters(
     if query_vec is None:
         return []
 
+    quantized_vec = quantize_to_int8(query_vec)
+
     contract_filter = ""
-    bind_params: dict = {"top_k": top_k, "query_vec": json.dumps(query_vec)}
+    bind_params: dict = {"top_k": top_k, "query_vec": json.dumps(quantized_vec)}
     if contract_ids:
         placeholders = ", ".join(f":cid{i}" for i in range(len(contract_ids)))
         contract_filter = f"AND p.contract_id IN ({placeholders})"
@@ -216,7 +225,7 @@ async def vector_search_parameters(
             p.source_query,
             p.is_user_added,
             p.is_verified,
-            VECTOR_DISTANCE(p.vector_embed, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, FLOAT32), COSINE) AS distance
+            VECTOR_DISTANCE(p.vector_embed, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, INT8), COSINE) AS distance
         FROM contract_parameters_extracted p
         WHERE p.vector_embed IS NOT NULL
         {contract_filter}
@@ -249,6 +258,8 @@ async def vector_search_chunks(
     if query_vec is None:
         return []
 
+    quantized_vec = quantize_to_int8(query_vec)
+
     sql = text(f"""
         SELECT
             c.chunk_id,
@@ -258,7 +269,7 @@ async def vector_search_chunks(
             c.char_start,
             c.char_end,
             c.spatial_json,
-            VECTOR_DISTANCE(c.chunk_vector, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, FLOAT32), COSINE) AS distance
+            VECTOR_DISTANCE(c.chunk_vector, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, INT8), COSINE) AS distance
         FROM contract_document_chunks c
         WHERE c.contract_id = :contract_id
           AND c.chunk_vector IS NOT NULL
@@ -267,7 +278,7 @@ async def vector_search_chunks(
     """)
 
     try:
-        result = await db.execute(sql, {"contract_id": contract_id, "top_k": top_k, "query_vec": json.dumps(query_vec)})
+        result = await db.execute(sql, {"contract_id": contract_id, "top_k": top_k, "query_vec": json.dumps(quantized_vec)})
         rows = result.mappings().all()
         return [dict(row) for row in rows]
     except Exception as exc:
@@ -285,7 +296,7 @@ async def vector_search_chunks(
             if not getattr(vector_search_chunks, "_vector_warning_emitted", False):
                 clm_logger.warning(
                     "[VectorSearch] Oracle VECTOR type not supported on this instance. "
-                    "Requires Oracle 23ai. Chunk vector search disabled."
+                    "Requires Oracle 26ai. Chunk vector search disabled."
                 )
                 vector_search_chunks._vector_warning_emitted = True  # type: ignore[attr-defined]
         else:
@@ -306,6 +317,8 @@ async def vector_search_documents(
     if query_vec is None:
         return []
 
+    quantized_vec = quantize_to_int8(query_vec)
+
     sql = text(f"""
         SELECT
             c.contract_id,
@@ -313,7 +326,7 @@ async def vector_search_documents(
             c.agreement_type,
             c.organization,
             c.uploaded_filename,
-            VECTOR_DISTANCE(c.document_vector, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, FLOAT32), COSINE) AS distance
+            VECTOR_DISTANCE(c.document_vector, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, INT8), COSINE) AS distance
         FROM contracts_master c
         WHERE c.document_vector IS NOT NULL
         ORDER BY distance ASC
@@ -321,9 +334,129 @@ async def vector_search_documents(
     """)
 
     try:
-        result = await db.execute(sql, {"top_k": top_k, "query_vec": json.dumps(query_vec)})
+        result = await db.execute(sql, {"top_k": top_k, "query_vec": json.dumps(quantized_vec)})
         rows = result.mappings().all()
         return [dict(row) for row in rows]
     except Exception as exc:
         clm_logger.error(f"[VectorSearch] Document vector search failed: {exc}", exc_info=True)
+        return []
+
+
+async def vector_search_published_parameters(
+    db: AsyncSession,
+    query_text: str,
+    contract_ids: Optional[List[str]] = None,
+    top_k: int = 5,
+) -> List[dict]:
+    """
+    Searches published_parameters using Oracle 26ai VECTOR_DISTANCE with cosine similarity.
+    This is the default retrieval path for the assistant — it only surfaces approved data.
+
+    Falls back to empty list if embeddings are unavailable or the table does not exist.
+    """
+    query_vec = embed(query_text)
+    if query_vec is None:
+        return []
+
+    quantized_vec = quantize_to_int8(query_vec)
+
+    contract_filter = ""
+    bind_params: dict = {"top_k": top_k, "query_vec": json.dumps(quantized_vec)}
+    if contract_ids:
+        placeholders = ", ".join(f":cid{i}" for i in range(len(contract_ids)))
+        contract_filter = f"AND pp.contract_id IN ({placeholders})"
+        for i, cid in enumerate(contract_ids):
+            bind_params[f"cid{i}"] = cid
+
+    sql = text(f"""
+        SELECT
+            pp.published_param_id,
+            pp.published_id,
+            pp.contract_id,
+            pp.header_name,
+            pp.param_name,
+            pp.effective_value,
+            pp.citation_text,
+            pp.citation_start,
+            pp.citation_end,
+            pp.spatial_json,
+            pp.source_query,
+            VECTOR_DISTANCE(pp.vector_embed, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, INT8), COSINE) AS distance
+        FROM published_parameters pp
+        WHERE pp.vector_embed IS NOT NULL
+        {contract_filter}
+        ORDER BY distance ASC
+        FETCH FIRST :top_k ROWS ONLY
+    """)
+
+    try:
+        result = await db.execute(sql, bind_params)
+        rows = result.mappings().all()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        exc_str = str(exc).lower()
+        if "942" in exc_str or "does not exist" in exc_str:
+            if not getattr(vector_search_published_parameters, "_ddl_warning_emitted", False):
+                clm_logger.warning(
+                    "[VectorSearch] 'published_parameters' table not found. "
+                    "Run the published tables DDL from schema_oracle26ai.sql. "
+                    "Assistant will fall back to draft tables."
+                )
+                vector_search_published_parameters._ddl_warning_emitted = True  # type: ignore[attr-defined]
+        else:
+            clm_logger.error(f"[VectorSearch] published_parameters search failed: {exc}", exc_info=True)
+        return []
+
+
+async def vector_search_published_chunks(
+    db: AsyncSession,
+    query_text: str,
+    contract_id: str,
+    top_k: int = 5,
+) -> List[dict]:
+    """
+    Cosine similarity search scoped to a single contract's published chunks.
+    Used by the assistant when draft_mode=False (default production behaviour).
+    Falls back to empty list if the published_chunks table does not yet exist.
+    """
+    query_vec = embed(query_text)
+    if query_vec is None:
+        return []
+
+    quantized_vec = quantize_to_int8(query_vec)
+
+    sql = text(f"""
+        SELECT
+            pc.published_chunk_id,
+            pc.published_id,
+            pc.contract_id,
+            pc.chunk_index,
+            pc.chunk_text,
+            pc.char_start,
+            pc.char_end,
+            pc.spatial_json,
+            VECTOR_DISTANCE(pc.chunk_vector, TO_VECTOR(:query_vec, {settings.embedding_vector_dim}, INT8), COSINE) AS distance
+        FROM published_chunks pc
+        WHERE pc.contract_id = :contract_id
+          AND pc.chunk_vector IS NOT NULL
+        ORDER BY distance ASC
+        FETCH FIRST :top_k ROWS ONLY
+    """)
+
+    try:
+        result = await db.execute(sql, {"contract_id": contract_id, "top_k": top_k, "query_vec": json.dumps(quantized_vec)})
+        rows = result.mappings().all()
+        return [dict(row) for row in rows]
+    except Exception as exc:
+        exc_str = str(exc).lower()
+        if "942" in exc_str or "does not exist" in exc_str:
+            if not getattr(vector_search_published_chunks, "_ddl_warning_emitted", False):
+                clm_logger.warning(
+                    "[VectorSearch] 'published_chunks' table not found. "
+                    "Run the published tables DDL from schema_oracle26ai.sql. "
+                    "Assistant chunk search disabled."
+                )
+                vector_search_published_chunks._ddl_warning_emitted = True  # type: ignore[attr-defined]
+        else:
+            clm_logger.error(f"[VectorSearch] published_chunks search failed: {exc}", exc_info=True)
         return []

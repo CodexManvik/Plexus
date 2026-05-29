@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.models.orm import ContractAuditTrail, ContractMaster
+from app.models.orm import ContractAuditTrail, ContractMaster, MasterExtractionRule
 from app.schemas.pydantic_models import (
     ActivityLogItem,
     BacklogDepartmentItem,
@@ -45,6 +45,16 @@ async def get_dashboard_analytics(db: AsyncSession = Depends(get_db)):
     executed = (await db.execute(executed_query)).scalar_one()
     pending = (await db.execute(pending_query)).scalar_one()
     closing_soon = (await db.execute(soon_query)).scalar_one()
+
+    pending_rule_count_query = (
+        select(func.count())
+        .select_from(MasterExtractionRule)
+        .where(
+            MasterExtractionRule.is_active == False,  # noqa: E712
+            MasterExtractionRule.created_by == "SYSTEM_AI_PROPOSAL",
+        )
+    )
+    pending_rule_count = (await db.execute(pending_rule_count_query)).scalar_one()
 
     kpis = KPIDashboardResponse(
         executed=KPIItem(value=executed, label="Approved contracts"),
@@ -115,6 +125,7 @@ async def get_dashboard_analytics(db: AsyncSession = Depends(get_db)):
         backlog=backlog,
         expiries=expiries,
         activity=activity,
+        pending_rule_count=pending_rule_count,
     )
 
 

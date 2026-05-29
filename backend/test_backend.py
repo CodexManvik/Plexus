@@ -42,6 +42,13 @@ async def run_integration_tests():
         contract_id = contract["contract_id"]
         print(f"Uploaded successfully! Ingested Contract ID: {contract_id}")
         print(f"Workflow State: {contract['workflow_state']}")
+
+        # Confirm suggestions / Accept tags to trigger the full extraction pipeline
+        print("\nAccepting suggested metadata tags...")
+        accept_res = await client.post(f"{API_URL}/contracts/{contract_id}/accept-tags", json={"modified_by": "Alex Miller"})
+        assert accept_res.status_code == 200, f"Accept tags failed: {accept_res.text}"
+        contract = accept_res.json()
+        print(f"Workflow State after accepting tags: {contract['workflow_state']}")
         print(f"Extracted parameters count: {len(contract['parameters'])}")
         for param in contract["parameters"]:
             print(f"  - Parameter: '{param['header_name']}' => Extract: '{param['user_override']}' (Confidence Score: {param['match_score']})")

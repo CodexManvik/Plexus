@@ -1,8 +1,10 @@
 """
-llm.py — Cohere-only LLM service.
+llm.py — Cohere-only and Local Llama.cpp LLM services.
 """
 import asyncio
 import sys
+import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -15,7 +17,6 @@ class CohereService:
     def __init__(self):
         self.cohere_api_key = settings.cohere_api_key or ""
         self.cohere_model = settings.cohere_model
-        self.cohere_extraction_model = settings.cohere_extraction_model
         self._client: Optional[httpx.AsyncClient] = None
 
     def _get_client(self) -> httpx.AsyncClient:
@@ -152,10 +153,10 @@ class CohereService:
         user_prompt: str,
     ) -> str:
         """
-        Faster, optimized extraction completion using the specialized extraction model.
+        Extraction completion using the single configured Cohere model.
         """
         return await self._execute_cohere_chat(
-            model=self.cohere_extraction_model,
+            model=self.cohere_model,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             response_format=None,
@@ -164,4 +165,102 @@ class CohereService:
         )
 
 
-azure_llm = CohereService()
+class LocalLLMService:
+    """
+    LocalLLMService — Remote high-speed inference tier using Groq API for narrow
+    grounding, validation, and OCR noise repair tasks.
+    Falls back to CohereService if GROQ_API_KEY is not configured.
+    """
+    def __init__(self):
+        self.groq_api_key = settings.groq_api_key or ""
+        self.groq_model = settings.groq_model
+        self._client: Optional[httpx.AsyncClient] = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=45.0)
+        return self._client
+
+    async def aclose(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+        self._client = None
+
+    async def get_completion(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> str:
+        """
+        Queries the Groq API via HTTPX Chat Completions endpoint, with CohereService fallback.
+        """
+        if not self.groq_api_key:
+            clm_logger.info("[LocalLLM/Groq] No GROQ_API_KEY configured. Delegating task to Cohere.")
+            return await cohere_llm.get_chat_completion(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.groq_model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        clm_logger.info(f"[LocalLLM/Groq] Request -> Model: {self.groq_model} | Temp: {temperature} | MaxTokens: {max_tokens}")
+        client = self._get_client()
+        backoff = 1.0
+
+        for attempt in range(4):
+            try:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                choices = data.get("choices", [])
+                if choices:
+                    content = choices[0].get("message", {}).get("content", "").strip()
+                    if content:
+                        clm_logger.info(f"[LocalLLM/Groq] Response -> Success (chars={len(content)})")
+                        return content
+                return ""
+            except httpx.HTTPStatusError as error:
+                clm_logger.warning(
+                    f"[LocalLLM/Groq] HTTP {error.response.status_code} on attempt {attempt+1}: {error.response.text[:200]}"
+                )
+                if error.response.status_code in (429, 500, 502, 503, 504) and attempt < 3:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                break
+            except Exception as error:
+                clm_logger.warning(f"[LocalLLM/Groq] Connection Error on attempt {attempt+1}: {error}")
+                if attempt < 3:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2.0
+                    continue
+                break
+
+        clm_logger.error("[LocalLLM/Groq] Request failed after retries. Delegating fallback to Cohere.")
+        return await cohere_llm.get_chat_completion(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+
+cohere_llm = CohereService()
+local_llm = LocalLLMService()

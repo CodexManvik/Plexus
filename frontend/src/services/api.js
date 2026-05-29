@@ -62,6 +62,21 @@ export const api = {
   getExtractionStatus: async (contractId) =>
     getData(apiClient.get(`/contracts/${contractId}/extraction-status`)),
 
+  getTagSuggestions: async (contractId) =>
+    getData(apiClient.get(`/contracts/${contractId}/suggest-tags`)),
+
+  acceptTags: async (contractId, payload) =>
+    getData(apiClient.post(`/contracts/${contractId}/accept-tags`, payload)),
+
+  editTags: async (contractId, payload) =>
+    getData(apiClient.post(`/contracts/${contractId}/edit-tags`, payload)),
+
+  pauseDraft: async (contractId, payload) =>
+    getData(apiClient.post(`/contracts/${contractId}/pause`, payload)),
+
+  resumeDraft: async (contractId, payload) =>
+    getData(apiClient.post(`/contracts/${contractId}/resume`, payload)),
+
   acquireLock: async (contractId, userId) =>
     getData(apiClient.post(`/contracts/${contractId}/lock`, { user_id: userId })),
 
